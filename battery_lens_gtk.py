@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BatteryLens - GTK3 native battery charge history viewer
-Version: 1.0.0
+Version: 1.1.0
 Repository: https://github.com/Filoviridae/batterylens
 """
 
@@ -39,7 +39,7 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 GLib.set_prgname('batterylens')
 GLib.set_application_name('BatteryLens')
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = "Filoviridae/batterylens"
 SLEEP_GAP_THRESHOLD_S = 900  # 15 min
 
