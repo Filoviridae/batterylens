@@ -8,7 +8,8 @@ Repository: https://github.com/Filoviridae/batterylens
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Gio
+gi.require_version('Pango', '1.0')
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Gio, Pango
 
 import os
 import sys
@@ -30,6 +31,13 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 from matplotlib.backends.backend_cairo import FigureCanvasCairo, RendererCairo
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+# Must match the installed .desktop file's basename so GNOME Shell (Wayland
+# app_id lookup) and window managers (X11 WM_CLASS) resolve the right icon
+# instead of falling back to the Python interpreter's icon.
+GLib.set_prgname('batterylens')
+GLib.set_application_name('BatteryLens')
 
 VERSION = "1.0.0"
 REPO = "Filoviridae/batterylens"
@@ -55,16 +63,27 @@ SLEEP_LINE = '#6E6E7A'
 RATING_COLORS = {'great': GREAT, 'good': GOOD, 'fair': FAIR,
                  'poor': POOR, 'active': ACTIVE, 'light': SUBTEXT}
 
+FULL_EQUIV_TOOLTIP = (
+    "Projected 100% → 0% battery life, based on the drain rate actually "
+    "observed during active/screen-on time — scaled up if the session "
+    "didn't run the full range."
+)
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
 * { font-family: "Inter", "Cantarell", sans-serif; }
 
-/* Force dark background on ALL widgets */
-window,
+/* Force dark background on the window itself; plain layout containers stay
+   transparent so nested boxes don't paint an opaque rectangle on top of a
+   differently-coloured card (session-row, bat-strip, stat-box, etc.) */
+window {
+    background-color: #1C1C1E;
+    color: #FFFFFF;
+}
 box, grid, scrolledwindow, viewport,
 stack, paned, frame, eventbox,
-listbox, listboxrow {
-    background-color: #1C1C1E;
+list, row {
+    background-color: transparent;
     color: #FFFFFF;
 }
 
@@ -91,13 +110,27 @@ scrollbar slider { background-color: #3A3A3C; border-radius: 4px; min-width: 4px
 paned > separator { background-color: #3A3A3C; min-width: 1px; }
 
 /* ListBox rows — no hover highlight by default */
-listboxrow { background-color: transparent; }
-listboxrow:hover { background-color: transparent; }
+row { background-color: transparent; outline: none; }
+row:hover { background-color: transparent; }
 
 /* Dialog */
 dialog { background-color: #2C2C2E; }
 dialog box { background-color: #2C2C2E; }
 .dialog-action-area { background-color: #2C2C2E; }
+
+/* ── Title bar ── */
+#app-headerbar {
+    background-color: #1C1C1E;
+    background-image: none;
+    color: #FFFFFF;
+    border-bottom: 1px solid #3A3A3C;
+    box-shadow: none;
+}
+#app-headerbar button {
+    background: none;
+    color: #8E8E93;
+}
+#app-headerbar button:hover { background-color: #3A3A3C; color: #FFFFFF; }
 
 /* ── Sidebar ── */
 #sidebar { background-color: #141416; border-right: 1px solid #3A3A3C; }
@@ -127,7 +160,7 @@ dialog box { background-color: #2C2C2E; }
 /* ── Session list background ── */
 #session-list-scroll,
 #session-list-scroll viewport,
-#session-list-scroll listbox {
+#session-list-scroll list {
     background-color: #141416;
 }
 
@@ -148,6 +181,14 @@ dialog box { background-color: #2C2C2E; }
     border-radius: 6px;
     padding: 2px 8px;
     font-size: 10px;
+    color: #007AFF;
+    font-weight: 600;
+}
+.discharge-banner {
+    background-color: rgba(0,122,255,0.15);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
     color: #007AFF;
     font-weight: 600;
 }
@@ -461,11 +502,17 @@ def resolve_hidden_idxs(sessions, hidden_ts):
 # CHART LAYER  (matplotlib → Cairo surface → Gtk.DrawingArea)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fig_to_pixbuf(fig, dpi=150):
-    """Render a matplotlib figure to a GdkPixbuf via PNG."""
+def _fig_to_pixbuf(fig, dpi=150, tight=True):
+    """Render a matplotlib figure to a GdkPixbuf via PNG.
+
+    tight=False skips bbox_inches='tight' — that crop happens after
+    ax.get_position() is captured elsewhere, so it silently invalidates any
+    figure-relative bbox fractions computed beforehand (needed for mapping
+    cursor position to data points for hover tooltips)."""
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
-                facecolor=fig.get_facecolor())
+    kwargs = dict(bbox_inches='tight') if tight else {}
+    fig.savefig(buf, format='png', dpi=dpi,
+                facecolor=fig.get_facecolor(), **kwargs)
     buf.seek(0)
     loader = GdkPixbuf.PixbufLoader.new_with_type('png')
     loader.write(buf.read())
@@ -473,7 +520,11 @@ def _fig_to_pixbuf(fig, dpi=150):
     return loader.get_pixbuf()
 
 def _smart_xticks(ax, max_h):
-    nice = [0.5, 1, 2, 3, 4, 6, 8, 12, 24]
+    # Smaller candidates matter for a freshly-started active session, which
+    # might only have ~1 hour (or less) of data — without them, nothing in
+    # the list satisfies the ratio check below and it silently fell through
+    # to a 24h step, producing a single meaningless "0h, 24h" tick pair.
+    nice = [0.05, 0.1, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 24]
     step = nice[-1]
     for s in nice:
         if 4 <= max_h / s <= 9:
@@ -494,16 +545,28 @@ def _style_ax(ax, fig):
     ax.spines['right'].set_visible(False)
     ax.spines['bottom'].set_color(BG3)
     ax.spines['left'].set_visible(False)
-    ax.tick_params(colors=SUBTEXT, which='both', length=0)
-    ax.set_yticks([0, 25, 50, 75, 100])
-    ax.set_yticklabels(['0%', '25%', '50%', '75%', '100%'], color=SUBTEXT, fontsize=8)
+    ax.tick_params(colors=SUBTEXT, which='both', length=0, labelsize=8)
+    # Let matplotlib auto-pick gridlines that actually fall within whatever
+    # ylim gets set later, instead of fixed 0/25/50/75/100 positions — those
+    # go missing entirely on a zoomed-in range (e.g. a fresh active session
+    # that's only dropped a few percent), leaving just one visible gridline.
+    # integer=True forces whole-number tick positions — without it, a
+    # gridline can land at e.g. 97.5% while its label is rounded to "98%",
+    # making a data point that's genuinely at 98% look off the line.
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 5, 10], integer=True))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:.0f}%'))
 
-def _draw_discharge_line(ax, pts, xs, ys, color):
+def _draw_discharge_line(ax, pts, xs, ys, color, show_points=False):
     """Draw solid line for active periods, dashed for sleep gaps."""
     active_xs, active_ys = [xs[0]], [ys[0]]
     any_sleep = False
     first_sleep = True
     first_active = [True]
+    # Bigger + a contrasting edge — the chart is rendered at high DPI then
+    # downscaled to fit the display width, so small same-color markers
+    # shrink into the line itself and disappear after that downscale
+    point_kwargs = dict(marker='o', markersize=6,
+                         markeredgewidth=1, markeredgecolor=BG2) if show_points else {}
 
     def flush(rxs, rys):
         if len(rxs) < 2:
@@ -511,7 +574,7 @@ def _draw_discharge_line(ax, pts, xs, ys, color):
         ax.fill_between(rxs, rys, alpha=0.2, color=color, zorder=3)
         lbl = 'Active' if first_active[0] else None
         ax.plot(rxs, rys, color=color, linewidth=2.5,
-                solid_capstyle='round', zorder=5, label=lbl)
+                solid_capstyle='round', zorder=5, label=lbl, **point_kwargs)
         if first_active[0]:
             ax.plot(rxs[0], rys[0], 'o', color=color, markersize=7,
                     zorder=6, markerfacecolor=BG2, markeredgewidth=2)
@@ -525,7 +588,7 @@ def _draw_discharge_line(ax, pts, xs, ys, color):
             lbl = 'Sleeping' if first_sleep else None
             ax.plot([xs[i-1], xs[i]], [ys[i-1], ys[i]],
                     color=SLEEP_LINE, linewidth=1.5, linestyle='--',
-                    alpha=0.7, zorder=4, label=lbl)
+                    alpha=0.7, zorder=4, label=lbl, **point_kwargs)
             first_sleep = False
             active_xs, active_ys = [xs[i]], [ys[i]]
         else:
@@ -539,23 +602,42 @@ def _draw_discharge_line(ax, pts, xs, ys, color):
         ax.legend(fontsize=8, facecolor=BG2, edgecolor=BG3,
                   labelcolor=SUBTEXT, loc='upper right')
 
-def make_detail_pixbuf(session, dpi=150):
+def make_detail_pixbuf(session, dpi=150, show_points=False):
+    """Returns (pixbuf, meta) — meta captures the axes' bounding box as a
+    figure-relative fraction (independent of any later display scaling) plus
+    the data range, so a hover handler can map cursor position back to the
+    nearest data point without re-deriving matplotlib's tight_layout math."""
     pts = session['points']
     xs  = [(p['ts'] - pts[0]['ts']) / 3600 for p in pts]
     ys  = [p['val'] for p in pts]
     color = RATING_COLORS.get(
         'active' if session.get('active') else session['usage_rating'], GOOD)
 
+    xlim = (min(xs) - 0.05, max(xs) + 0.05)
+    ylim = (max(0, min(ys) - 10), 100)
+
     fig, ax = plt.subplots(figsize=(6.5, 2.8))
     _style_ax(ax, fig)
-    ax.set_xlim(min(xs) - 0.05, max(xs) + 0.05)
-    ax.set_ylim(max(0, min(ys) - 10), 108)
-    _draw_discharge_line(ax, pts, xs, ys, color)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    _draw_discharge_line(ax, pts, xs, ys, color, show_points=show_points)
     _smart_xticks(ax, max(xs))
     plt.tight_layout(pad=0.4)
-    pb = _fig_to_pixbuf(fig, dpi)
+    bbox = ax.get_position()
+    pb = _fig_to_pixbuf(fig, dpi, tight=False)
     plt.close(fig)
-    return pb
+
+    meta = {
+        'bbox': (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+        'xlim': xlim,
+        'ylim': ylim,
+        'points': [
+            ((p['ts'] - pts[0]['ts']) / 3600, p['val'],
+             datetime.datetime.fromtimestamp(p['ts']).strftime('%-I:%M %p'))
+            for p in pts
+        ],
+    }
+    return pb, meta
 
 def make_overview_pixbuf(sessions, dpi=150):
     recent = [s for s in sessions if not s.get('active')][:10]
@@ -594,7 +676,7 @@ def make_estimate_pixbuf(session, avg_rate, current_pct, rolling_rate, dpi=150):
 
     proj_end = now_h + (current_pct / avg_rate) if avg_rate > 0 else now_h + 2
     ax.set_xlim(-0.05, max(xs[-1] + 0.5, proj_end + 0.3))
-    ax.set_ylim(-2, 105)
+    ax.set_ylim(0, 100)
 
     _draw_discharge_line(ax, pts, xs, ys, ACTIVE)
 
@@ -711,6 +793,40 @@ def _pixbuf_image(pb, width=None):
         img.set_from_pixbuf(scaled)
     return img
 
+def _chart_width(card, default=680, min_w=280, max_w=900):
+    """Chart render width from the card's real allocated width, so charts
+    shrink/grow with the window instead of clipping at a fixed size."""
+    alloc = card.get_allocated_width()
+    if alloc <= 1:
+        return default
+    return max(min_w, min(max_w, alloc - 32))  # 32 = .chart-card's l/r padding
+
+def _capped_image_wrapper(image, min_w=280, max_w=900):
+    """Wrap a chart Gtk.Image in a ScrolledWindow with an explicit
+    min/max-content-width. A bare Gtk.Image reports its full pixbuf size as
+    its own minimum, which otherwise propagates straight up and pins the
+    whole window's real minimum width to whatever the chart was last
+    rendered at. Horizontal policy must be EXTERNAL (not NEVER) — with
+    NEVER, GTK still reserves the child's full width to avoid clipping,
+    regardless of min/max-content-width. EXTERNAL gets the same sizing
+    benefit as AUTOMATIC but never actually shows a scrollbar widget (which
+    would otherwise sit on top of the chart and intercept hover events)."""
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+    sw.set_min_content_width(min_w)
+    sw.set_max_content_width(max_w)
+    sw.set_min_content_height(1)
+    sw.set_propagate_natural_width(False)
+    # We never actually want scrolling/panning here — this ScrolledWindow
+    # exists purely as a trick to get min/max-content-width sizing. Kinetic
+    # scrolling can still engage a drag-to-pan cursor and gesture recognizer
+    # (visible as the 4-way move cursor) whenever content is even a pixel
+    # wider than the viewport, which also interferes with hover events.
+    sw.set_kinetic_scrolling(False)
+    sw.set_overlay_scrolling(False)
+    sw.add(image)
+    return sw
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION WINDOW
@@ -746,7 +862,9 @@ class BatteryLensWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title='BatteryLens')
         self.set_default_size(1100, 720)
-        self.set_size_request(800, 500)
+        # Kept low enough that GNOME's edge-tiling (snapping to half the
+        # screen) isn't refused for being under the window's minimum size
+        self.set_size_request(640, 480)
         self.connect('destroy', Gtk.main_quit)
 
         # Set window icon for taskbar
@@ -758,20 +876,44 @@ class BatteryLensWindow(Gtk.Window):
                 pass
         self.set_wmclass('batterylens', 'BatteryLens')
 
+        # Custom dark titlebar — the system default renders light/white and
+        # clashes with the app's dark theme, since it's drawn outside our
+        # own widget tree and isn't reachable by our CSS provider.
+        headerbar = Gtk.HeaderBar()
+        headerbar.set_show_close_button(True)
+        headerbar.set_title('BatteryLens')
+        headerbar.set_name('app-headerbar')
+        self.set_titlebar(headerbar)
+
         # App state
         self._sessions     = []
         self._hidden_ts    = load_hidden_ts()
         self._hidden_idxs  = set()
         self._selected_idx = None
         self._bat_info     = None
+        self._had_active   = False
+        self._resize_debounce_id = None
+        self._show_data_points = False
         self._dpi = int(min(2.2, self.get_scale_factor() or 1) * 120)
 
         self._build_ui()
         self._apply_css()
         self._load_data()
 
-        # Auto-refresh every 60s when there's an active session
+        # _load_data() jumps to a newly-active session automatically; if none
+        # was found, land on Overview instead of the blank empty state
+        if self._selected_idx is None and self._visible_sessions():
+            self._switch_tab('overview')
+
+        # Auto-refresh every 60s when there's an active session, or when the
+        # OS reports discharging even though upowerd hasn't logged it yet
         GLib.timeout_add_seconds(60, self._auto_refresh)
+
+        # Re-render charts if the display's scale factor changes (e.g. moving
+        # to a different-DPI monitor) or the window is resized/tiled, so
+        # charts stay sharp and correctly sized instead of stale/fixed-width
+        self.connect('notify::scale-factor', self._on_scale_factor_changed)
+        self.connect('configure-event', self._on_window_configure)
 
     # ── CSS ───────────────────────────────────────────────────────────────────
 
@@ -837,7 +979,7 @@ class BatteryLensWindow(Gtk.Window):
         stats_box.set_margin_top(10)
         stats_box.set_margin_bottom(6)
 
-        self._stat_avg      = self._small_stat('—', 'Avg Life')
+        self._stat_avg      = self._small_stat('—', 'Avg Life', FULL_EQUIV_TOOLTIP)
         self._stat_best     = self._small_stat('—', 'Best')
         self._stat_sessions = self._small_stat('0', 'Sessions')
 
@@ -875,11 +1017,13 @@ class BatteryLensWindow(Gtk.Window):
 
         return sidebar
 
-    def _small_stat(self, val, lbl):
+    def _small_stat(self, val, lbl, tooltip=None):
         box = _box(spacing=1)
         box.get_style_context().add_class('stat-box')
         box.set_margin_start(3)
         box.set_margin_end(3)
+        if tooltip:
+            box.set_tooltip_text(tooltip)
         val_lbl = _label(val, 'stat-val', xalign=0.5)
         val_lbl.set_halign(Gtk.Align.CENTER)
         lbl_lbl = _label(lbl, 'stat-lbl', xalign=0.5)
@@ -949,6 +1093,17 @@ class BatteryLensWindow(Gtk.Window):
         _set_color(sub_lbl, SUBTEXT)
         box.pack_start(hdr_row, False, False, 0)
         box.pack_start(sub_lbl, False, False, 4)
+
+        self._live_discharge_banner = _label(
+            "● Currently discharging — this session will appear below once the "
+            "system logs its first battery reading for it (can take a few minutes)",
+            'discharge-banner')
+        self._live_discharge_banner.set_line_wrap(True)
+        self._live_discharge_banner.set_halign(Gtk.Align.START)
+        self._live_discharge_banner.set_no_show_all(True)
+        self._live_discharge_banner.hide()
+        box.pack_start(self._live_discharge_banner, False, False, 4)
+
         box.pack_start(_box(spacing=0), False, False, 8)
 
         # Battery strip
@@ -963,7 +1118,7 @@ class BatteryLensWindow(Gtk.Window):
         self._overview_chart_lbl.set_margin_bottom(6)
         self._overview_chart_image = Gtk.Image()
         self._overview_chart_card.pack_start(self._overview_chart_lbl, False, False, 0)
-        self._overview_chart_card.pack_start(self._overview_chart_image, False, False, 0)
+        self._overview_chart_card.pack_start(_capped_image_wrapper(self._overview_chart_image), False, False, 0)
         box.pack_start(self._overview_chart_card, False, False, 4)
         self._overview_chart_card.hide()
 
@@ -973,9 +1128,9 @@ class BatteryLensWindow(Gtk.Window):
         self._ov_stat_grid.set_row_spacing(0)
         self._ov_stat_grid.set_column_spacing(0)
         self._ov_stat_grid.set_margin_top(4)
-        self._ov_stat_avg = self._make_stat_card('—', 'Avg life (active)')
+        self._ov_stat_avg = self._make_stat_card('—', 'Avg life (active)', tooltip=FULL_EQUIV_TOOLTIP)
         self._ov_stat_best = self._make_stat_card('—', 'Best session')
-        self._ov_stat_worst = self._make_stat_card('—', 'Worst session')
+        self._ov_stat_worst = self._make_stat_card('—', 'Worst session', tooltip=FULL_EQUIV_TOOLTIP)
         self._ov_stat_grid.attach(self._ov_stat_avg,   0, 0, 1, 1)
         self._ov_stat_grid.attach(self._ov_stat_best,  1, 0, 1, 1)
         self._ov_stat_grid.attach(self._ov_stat_worst, 2, 0, 1, 1)
@@ -1038,7 +1193,7 @@ class BatteryLensWindow(Gtk.Window):
         self._est_chart_lbl   = _label('Battery projection', 'chart-label')
         self._est_chart_image = Gtk.Image()
         self._est_chart_card.pack_start(self._est_chart_lbl,  False, False, 0)
-        self._est_chart_card.pack_start(self._est_chart_image, False, False, 0)
+        self._est_chart_card.pack_start(_capped_image_wrapper(self._est_chart_image), False, False, 0)
         box.pack_start(self._est_chart_card, False, False, 0)
 
         return box
@@ -1076,13 +1231,27 @@ class BatteryLensWindow(Gtk.Window):
         self._detail_title    = Gtk.Label()
         self._detail_title.set_name('detail-title')
         self._detail_title.set_xalign(0)
+        self._detail_title.set_line_wrap(True)
+        self._detail_title.set_max_width_chars(18)
         self._detail_subtitle = _label('', css_class=None)
         self._detail_subtitle.set_name('detail-subtitle')
+        self._detail_subtitle.set_line_wrap(True)
+        self._detail_subtitle.set_max_width_chars(20)
         text_box.pack_start(self._detail_title,    False, False, 0)
         text_box.pack_start(self._detail_subtitle, False, False, 0)
 
         self._detail_header.pack_start(icon_box, False, False, 0)
         self._detail_header.pack_start(text_box, True, True, 0)
+
+        self._detail_lag_note = _label('Data may lag several minutes', css_class=None)
+        self._detail_lag_note.set_valign(Gtk.Align.CENTER)
+        self._detail_lag_note.set_line_wrap(True)
+        self._detail_lag_note.set_max_width_chars(16)
+        _set_color(self._detail_lag_note, SUBTEXT)
+        self._detail_lag_note.set_no_show_all(True)
+        self._detail_lag_note.hide()
+        self._detail_header.pack_end(self._detail_lag_note, False, False, 0)
+
         box.pack_start(self._detail_header, False, False, 0)
 
         # Scrollable body
@@ -1106,7 +1275,7 @@ class BatteryLensWindow(Gtk.Window):
         # Stats grid
         self._detail_grid = Gtk.Grid()
         self._detail_grid.set_column_homogeneous(True)
-        self._detail_equiv_card = self._make_stat_card('—', 'Full-charge equiv. (active)')
+        self._detail_equiv_card = self._make_stat_card('—', 'Full-charge equiv. (active)', tooltip=FULL_EQUIV_TOOLTIP)
         self._detail_drain_card = self._make_stat_card('—', 'Battery drained')
         self._detail_rating_card = self._make_stat_card('—', 'Rating')
         self._detail_grid.attach(self._detail_equiv_card,  0, 0, 1, 1)
@@ -1136,19 +1305,47 @@ class BatteryLensWindow(Gtk.Window):
         body.pack_start(batt_card, False, False, 4)
 
         # Chart
-        chart_card = _box(spacing=4)
-        chart_card.get_style_context().add_class('chart-card')
-        chart_card.set_margin_top(4)
-        self._detail_chart_lbl   = _label('Battery level over time', 'chart-label')
-        self._detail_chart_image = Gtk.Image()
-        chart_card.pack_start(self._detail_chart_lbl,   False, False, 0)
-        chart_card.pack_start(self._detail_chart_image, False, False, 0)
-        body.pack_start(chart_card, False, False, 4)
+        self._detail_chart_card = _box(spacing=4)
+        self._detail_chart_card.get_style_context().add_class('chart-card')
+        self._detail_chart_card.set_margin_top(4)
 
-        # Points recorded
+        chart_hdr_row = _box(Gtk.Orientation.HORIZONTAL, 8)
+        self._detail_chart_lbl = _label('Battery level over time', 'chart-label')
+        chart_hdr_row.pack_start(self._detail_chart_lbl, True, True, 0)
+        self._detail_chart_hover_lbl = _label('', 'chart-label')
+        self._detail_chart_hover_lbl.set_xalign(1.0)
+        chart_hdr_row.pack_start(self._detail_chart_hover_lbl, False, False, 0)
+        self._detail_chart_card.pack_start(chart_hdr_row, False, False, 0)
+
+        self._detail_chart_image = Gtk.Image()
+        # Gtk.Image has no window of its own, so events must go through an
+        # EventBox — add_events() doesn't reliably work directly on a bare
+        # Image. The readout only appears when hovering close to an actual
+        # data point (not anywhere along the axes), shown via the fixed
+        # corner label rather than a floating popup — a real tooltip/overlay
+        # popup near the cursor kept interfering with further events.
+        chart_event_box = Gtk.EventBox()
+        chart_event_box.add(self._detail_chart_image)
+        chart_event_box.add_events(
+            Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        chart_event_box.connect('motion-notify-event', self._on_chart_motion)
+        chart_event_box.connect('leave-notify-event', self._on_chart_leave)
+        self._detail_chart_meta = None
+        self._detail_chart_card.pack_start(_capped_image_wrapper(chart_event_box), False, False, 0)
+        body.pack_start(self._detail_chart_card, False, False, 4)
+
+        # Points recorded, with a toggle for showing markers on the chart
+        points_row = _box(Gtk.Orientation.HORIZONTAL, 8)
+        points_row.set_margin_top(4)
         self._detail_points_card = self._make_stat_card('—', 'Data points recorded')
-        self._detail_points_card.set_margin_top(4)
-        body.pack_start(self._detail_points_card, False, False, 0)
+        points_row.pack_start(self._detail_points_card, True, True, 0)
+
+        self._show_points_check = Gtk.CheckButton(label='Show points')
+        self._show_points_check.set_valign(Gtk.Align.CENTER)
+        self._show_points_check.connect('toggled', self._on_toggle_show_points)
+        points_row.pack_start(self._show_points_check, False, False, 0)
+
+        body.pack_start(points_row, False, False, 0)
 
         sw.add(body)
         box.pack_start(sw, True, True, 0)
@@ -1174,13 +1371,23 @@ class BatteryLensWindow(Gtk.Window):
 
     # ── Reusable stat card widget ─────────────────────────────────────────────
 
-    def _make_stat_card(self, val, lbl, color=None):
+    def _make_stat_card(self, val, lbl, color=None, tooltip=None):
         card = _box(spacing=2)
         card.get_style_context().add_class('stat-card')
+        if tooltip:
+            card.set_tooltip_text(tooltip)
         val_lbl = _label(val, 'stat-card-val')
         if color:
             _set_color(val_lbl, color)
         lbl_lbl = _label(lbl, 'stat-card-lbl')
+        # Let the label wrap instead of forcing the card's full single-line
+        # text width — that was the main driver of the app's oversized real
+        # minimum width (it silently overrode set_size_request everywhere)
+        lbl_lbl.set_line_wrap(True)
+        lbl_lbl.set_max_width_chars(10)
+        lbl_lbl.set_justify(Gtk.Justification.CENTER)
+        lbl_lbl.set_halign(Gtk.Align.CENTER)
+        val_lbl.set_halign(Gtk.Align.CENTER)
         card.pack_start(val_lbl, False, False, 0)
         card.pack_start(lbl_lbl, False, False, 0)
         card._val_lbl = val_lbl
@@ -1239,19 +1446,58 @@ class BatteryLensWindow(Gtk.Window):
         self._hidden_idxs = resolve_hidden_idxs(self._sessions, self._hidden_ts)
         self._refresh_sidebar()
         self._refresh_overview()
-        # If the selected session is the active one, refresh its detail view too
+
+        active_s = next((s for s in self._sessions if s.get('active')), None)
+        had_active_before = self._had_active
+        self._had_active = active_s is not None
+
         if self._selected_idx is not None:
+            # If the selected session is the active one, refresh its detail view too
             s = self._sessions[self._selected_idx] if self._selected_idx < len(self._sessions) else None
             if s and s.get('active'):
                 self._show_session_detail(self._selected_idx)
+        elif active_s and not had_active_before:
+            # A session just became active (e.g. upowerd caught up after a
+            # charge cycle) — jump to it instead of leaving the user on Overview
+            self._show_session_detail(self._sessions.index(active_s))
         return True  # keep GLib.timeout running
 
     def _auto_refresh(self):
-        """Called every 60s — only reloads if there's an active session."""
+        """Called every 60s — reloads while there's an active session, or
+        while the OS reports discharging but upowerd hasn't logged it yet."""
         has_active = any(s.get('active') for s in self._sessions)
-        if has_active:
+        live_discharging = bool(self._bat_info) and \
+            self._bat_info.get('status', '').lower() == 'discharging'
+        if has_active or live_discharging:
             self._load_data()
         return True  # keep timer alive
+
+    def _on_scale_factor_changed(self, *_args):
+        """Display moved to a different-DPI monitor — recompute chart
+        resolution and force a redraw in case the compositor delivered the
+        real scale after the first frame was already painted (causes blur)."""
+        self._dpi = int(min(2.2, self.get_scale_factor() or 1) * 120)
+        self.queue_draw()
+        self._schedule_chart_rerender()
+
+    def _on_window_configure(self, widget, event):
+        """Window resized or tiled — re-render charts to fit, debounced so a
+        drag-resize doesn't trigger a matplotlib render on every frame."""
+        self._schedule_chart_rerender()
+        return False
+
+    def _schedule_chart_rerender(self):
+        if self._resize_debounce_id is not None:
+            GLib.source_remove(self._resize_debounce_id)
+        self._resize_debounce_id = GLib.timeout_add(200, self._rerender_visible_charts)
+
+    def _rerender_visible_charts(self):
+        self._resize_debounce_id = None
+        if self._selected_idx is not None:
+            self._show_session_detail(self._selected_idx)
+        else:
+            self._refresh_overview()
+        return False  # one-shot
 
     def _visible_sessions(self):
         return [s for i, s in enumerate(self._sessions)
@@ -1362,6 +1608,11 @@ class BatteryLensWindow(Gtk.Window):
                    s['start'].strftime('%-I:%M %p')
         date_lbl = _label('Now' if s.get('active') else time_str, 'session-date')
         time_lbl = _label(fmt_time_range(s['start'], s['end']), 'session-time')
+        # Ellipsize instead of forcing the row's full "3:54 PM - 10:03 PM"
+        # width — this and the sparkline below were the two biggest
+        # contributors to the sidebar's oversized real minimum width
+        time_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        time_lbl.set_width_chars(8)
         left.pack_start(date_lbl, False, False, 0)
         left.pack_start(time_lbl, False, False, 0)
         inner.pack_start(left, True, True, 0)
@@ -1370,7 +1621,7 @@ class BatteryLensWindow(Gtk.Window):
         try:
             pb = make_sparkline_pixbuf(s)
             if pb:
-                h = 30
+                h = 18
                 w = int(pb.get_width() * h / pb.get_height())
                 pb_scaled = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
                 spark_img = Gtk.Image.new_from_pixbuf(pb_scaled)
@@ -1381,7 +1632,7 @@ class BatteryLensWindow(Gtk.Window):
         # Duration
         right = _box(spacing=1)
         right.set_halign(Gtk.Align.END)
-        dur_lbl = _label(fmt_duration(s['duration_h']), 'session-duration')
+        dur_lbl = _label(fmt_duration(s.get('active_h', s['duration_h'])), 'session-duration')
         _set_color(dur_lbl, color)
         rng_lbl = _label(f"{s['start_pct']}%→{s['end_pct']}%", 'session-range')
         right.pack_start(dur_lbl, False, False, 0)
@@ -1406,6 +1657,15 @@ class BatteryLensWindow(Gtk.Window):
         completed = [s for s in visible if not s.get('active')]
         active_sessions = [s for s in visible if s.get('active')]
         active_only = (len(visible) == 1 and len(active_sessions) == 1)
+
+        # Live-discharging banner (covers the gap before upowerd logs the first
+        # history sample of a new session, e.g. right after a charge cycle)
+        live_discharging = bool(self._bat_info) and \
+            self._bat_info.get('status', '').lower() == 'discharging'
+        if live_discharging and not active_sessions:
+            self._live_discharge_banner.show()
+        else:
+            self._live_discharge_banner.hide()
 
         # Battery strip
         if self._bat_info:
@@ -1434,7 +1694,7 @@ class BatteryLensWindow(Gtk.Window):
         if completed:
             pb = make_overview_pixbuf(visible, self._dpi)
             if pb:
-                w = 680
+                w = _chart_width(self._overview_chart_card)
                 h = int(pb.get_height() * w / pb.get_width())
                 scaled = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
                 self._overview_chart_image.set_from_pixbuf(scaled)
@@ -1504,10 +1764,79 @@ class BatteryLensWindow(Gtk.Window):
 
         pb = make_estimate_pixbuf(s, avg_rate, current_pct, rolling_rate, self._dpi)
         if pb:
-            w = 680
+            w = _chart_width(self._est_chart_card)
             h = int(pb.get_height() * w / pb.get_width())
             scaled = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
             self._est_chart_image.set_from_pixbuf(scaled)
+
+    def _on_toggle_show_points(self, btn):
+        self._show_data_points = btn.get_active()
+        if self._selected_idx is not None:
+            self._show_session_detail(self._selected_idx)
+
+    def _chart_point_at(self, x, y):
+        """Map a cursor position (relative to the chart EventBox — the same
+        space the Gtk.Image inside it occupies) to the nearest data point.
+        Returns (nearest_point, point_px, point_py) or None if the cursor is
+        outside the plotted axes area. Uses the pixbuf's own dimensions
+        rather than the widget's allocation — the wrapping ScrolledWindow
+        can allocate the image more space than its pixbuf's natural size and
+        center it, which would otherwise throw off the bbox-fraction math."""
+        meta = self._detail_chart_meta
+        pb = self._detail_chart_image.get_pixbuf()
+        if not meta or not pb:
+            return None
+        pb_w, pb_h = pb.get_width(), pb.get_height()
+        off_x = (self._detail_chart_image.get_allocated_width() - pb_w) / 2
+        off_y = (self._detail_chart_image.get_allocated_height() - pb_h) / 2
+        px, py = x - off_x, y - off_y
+
+        bx0, by0, bx1, by1 = meta['bbox']
+        ax0, ax1 = bx0 * pb_w, bx1 * pb_w
+        ay0, ay1 = (1 - by1) * pb_h, (1 - by0) * pb_h
+        if not (ax0 <= px <= ax1 and ay0 <= py <= ay1):
+            return None
+
+        xlo, xhi = meta['xlim']
+        ylo, yhi = meta['ylim']
+
+        def to_px(pt):
+            t, pct, _ = pt
+            pt_x = off_x + ax0 + (t - xlo) / (xhi - xlo) * (ax1 - ax0)
+            pt_y = off_y + ay0 + (yhi - pct) / (yhi - ylo) * (ay1 - ay0)
+            return pt_x, pt_y
+
+        # Nearest by actual on-screen distance, not just time (x) distance —
+        # sessions with sleep gaps have long stretches of chart width with
+        # only two real points bracketing many hours, and picking "nearest
+        # in time" alone can point at a spot far from the cursor on screen
+        # whenever the line is steep or the two points aren't evenly spaced.
+        best_pt, best_px, best_dist = None, None, None
+        for pt in meta['points']:
+            cand_px = to_px(pt)
+            d = (cand_px[0] - x) ** 2 + (cand_px[1] - y) ** 2
+            if best_dist is None or d < best_dist:
+                best_pt, best_px, best_dist = pt, cand_px, d
+        return best_pt, best_px[0], best_px[1]
+
+    def _on_chart_motion(self, widget, event):
+        hit = self._chart_point_at(event.x, event.y)
+        if not hit:
+            self._detail_chart_hover_lbl.set_text('')
+            return False
+        nearest, point_px, point_py = hit
+        # Only show it when actually close to the point itself, not just
+        # anywhere in line with it on the x-axis.
+        dist = ((event.x - point_px) ** 2 + (event.y - point_py) ** 2) ** 0.5
+        if dist > 14:
+            self._detail_chart_hover_lbl.set_text('')
+            return False
+        self._detail_chart_hover_lbl.set_text(f'{nearest[2]} — {nearest[1]:.0f}%')
+        return False
+
+    def _on_chart_leave(self, widget, event):
+        self._detail_chart_hover_lbl.set_text('')
+        return False
 
     def _show_session_detail(self, idx):
         if idx < 0 or idx >= len(self._sessions):
@@ -1518,9 +1847,13 @@ class BatteryLensWindow(Gtk.Window):
             'active' if s.get('active') else s['usage_rating'], GOOD)
 
         # Header
+        active_h = s.get('active_h', s['duration_h'])
+        idle_h   = max(0, s['duration_h'] - active_h)
         self._detail_title.set_markup(
-            f'<span color="{color}" weight="heavy" size="x-large">'
-            f'{fmt_duration(s["duration_h"])}</span>')
+            f'<span color="{color}" weight="heavy" size="x-large">{fmt_duration(active_h)}</span>'
+            f'<span size="small" color="{SUBTEXT}"> screen on</span>'
+            f'   <span color="{SUBTEXT}" weight="heavy" size="x-large">{fmt_duration(idle_h)}</span>'
+            f'<span size="small" color="{SUBTEXT}"> idle</span>')
 
         # Date string
         if s['start'].date() != s['end'].date():
@@ -1528,17 +1861,18 @@ class BatteryLensWindow(Gtk.Window):
                         s['end'].strftime('%b %-d, %Y'))
         else:
             date_str = s['start'].strftime('%A, %B %-d, %Y')
-        self._detail_subtitle.set_text(
-            f'{date_str} · {fmt_time_range(s["start"], s["end"])}')
+        time_str = f'{s["start"].strftime("%-I:%M %p")} – {s["end"].strftime("%-I:%M %p")}'
+        self._detail_subtitle.set_text(f'{date_str} · {time_str}')
+
+        if s.get('active'):
+            self._detail_lag_note.show()
+        else:
+            self._detail_lag_note.hide()
 
         # Sleep note
         sleep_count = len(s.get('sleep_gaps', []))
-        active_h = s.get('active_h', s['duration_h'])
         if sleep_count > 0:
-            diff_h = s['duration_h'] - active_h
-            note = (f'{sleep_count} sleep period{"s" if sleep_count > 1 else ""} '
-                    f'detected.  Wall-clock: {fmt_duration(s["duration_h"])}  ·  '
-                    f'Active: {fmt_duration(active_h)}.  '
+            note = (f'{sleep_count} sleep period{"s" if sleep_count > 1 else ""} detected.  '
                     f'Full-charge equivalent calculated from active time only.')
             self._sleep_note.set_text(note)
             self._sleep_note_box.show()
@@ -1567,14 +1901,16 @@ class BatteryLensWindow(Gtk.Window):
         self._detail_chart_lbl.set_text(chart_lbl)
 
         # Chart (in thread to avoid blocking UI)
+        chart_w = _chart_width(self._detail_chart_card)
+        show_points = self._show_data_points
         def render_chart():
-            pb = make_detail_pixbuf(s, self._dpi)
+            pb, meta = make_detail_pixbuf(s, self._dpi, show_points=show_points)
             def update():
                 if pb:
-                    w = 680
-                    h = int(pb.get_height() * w / pb.get_width())
-                    scaled = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
+                    h = int(pb.get_height() * chart_w / pb.get_width())
+                    scaled = pb.scale_simple(chart_w, h, GdkPixbuf.InterpType.BILINEAR)
                     self._detail_chart_image.set_from_pixbuf(scaled)
+                    self._detail_chart_meta = meta
                 return False
             GLib.idle_add(update)
         threading.Thread(target=render_chart, daemon=True).start()
@@ -1589,11 +1925,9 @@ class BatteryLensWindow(Gtk.Window):
     def _switch_tab(self, name):
         self._tab_overview.get_style_context().add_class('tab-btn-active')
         if name == 'overview':
-            if self._selected_idx is not None:
-                self._stack.set_visible_child_name('detail')
-            else:
-                self._stack.set_visible_child_name('overview')
-                self._refresh_overview()
+            self._selected_idx = None
+            self._stack.set_visible_child_name('overview')
+            self._refresh_overview()
 
     # ── EVENT HANDLERS ────────────────────────────────────────────────────────
 
@@ -1650,7 +1984,7 @@ class BatteryLensWindow(Gtk.Window):
             inner.set_margin_bottom(8)
             date_lbl = _label(
                 s['start'].strftime('%b %-d, %Y  %-I:%M %p'), css_class=None)
-            dur_lbl = _label(fmt_duration(s['duration_h']), css_class=None)
+            dur_lbl = _label(fmt_duration(s.get('active_h', s['duration_h'])), css_class=None)
             color = RATING_COLORS.get(s['usage_rating'], GOOD)
             _set_color(dur_lbl, color)
             restore_btn = Gtk.Button(label='Restore')

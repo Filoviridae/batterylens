@@ -1918,7 +1918,7 @@ cat > "$LAUNCHER" << EOF
 EOF
 chmod +x "$LAUNCHER"
 ok "Launcher created"
-cat > "$DESKTOP_DIR/batterylens.desktop" << EOF
+cat > "$DESKTOP_DIR/io.github.filoviridae.batterylens.desktop" << EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -1943,5 +1943,5 @@ echo -e "   ${BOLD}Terminal:${RESET}  batterylens"
 echo -e "   ${BOLD}App menu:${RESET}  Search 'BatteryLens' in launcher"
 echo ""
 echo -e "   To uninstall:"
-echo -e "     rm -rf $APP_DIR $LAUNCHER $DESKTOP_DIR/batterylens.desktop $ICON_THEME_FILE"
+echo -e "     rm -rf $APP_DIR $LAUNCHER $DESKTOP_DIR/io.github.filoviridae.batterylens.desktop $ICON_THEME_FILE"
 echo ""
