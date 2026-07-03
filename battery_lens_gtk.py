@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BatteryLens - GTK3 native battery charge history viewer
-Version: 1.1.0
+Version: 1.1.2
 Repository: https://github.com/Filoviridae/batterylens
 """
 
@@ -36,15 +36,16 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 # Must match the installed .desktop file's basename so GNOME Shell (Wayland
 # app_id lookup) and window managers (X11 WM_CLASS) resolve the right icon
 # instead of falling back to the Python interpreter's icon.
-GLib.set_prgname('batterylens')
+GLib.set_prgname('io.github.filoviridae.batterylens')
 GLib.set_application_name('BatteryLens')
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 REPO = "Filoviridae/batterylens"
 SLEEP_GAP_THRESHOLD_S = 900  # 15 min
 
 APP_DIR   = os.path.expanduser('~/.local/share/batterylens')
 HIDDEN_FILE = os.path.join(APP_DIR, 'hidden_sessions.json')
+UNKNOWN_STATES_FILE = os.path.join(APP_DIR, 'unknown_states.json')
 ICON_PATH   = os.path.join(APP_DIR, 'batterylens-icon.png')
 
 # ── Colour palette (matches original dark theme) ─────────────────────────────
@@ -113,9 +114,13 @@ paned > separator { background-color: #3A3A3C; min-width: 1px; }
 row { background-color: transparent; outline: none; }
 row:hover { background-color: transparent; }
 
-/* Dialog */
-dialog { background-color: #2C2C2E; }
-dialog box { background-color: #2C2C2E; }
+/* Dialog — messagedialog is a distinct CSS node type from plain dialog
+   (GtkMessageDialog names its own node "messagedialog"), so both need
+   covering or one falls back to the system's light theme background while
+   still inheriting this app's white text color from the `box` rule below,
+   producing near-invisible white-on-white text. */
+dialog, messagedialog { background-color: #2C2C2E; }
+dialog box, messagedialog box { background-color: #2C2C2E; }
 .dialog-action-area { background-color: #2C2C2E; }
 
 /* ── Title bar ── */
@@ -192,6 +197,26 @@ dialog box { background-color: #2C2C2E; }
     color: #007AFF;
     font-weight: 600;
 }
+
+/* ── Live charging card (sidebar) ── */
+.charging-card {
+    background-color: rgba(52,199,89,0.14);
+    border: 1px dashed rgba(52,199,89,0.55);
+    border-radius: 12px;
+    padding: 10px 12px;
+}
+.charging-card:hover { background-color: rgba(52,199,89,0.20); }
+.charge-badge {
+    background-color: rgba(52,199,89,0.22);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #34C759;
+}
+.charge-pct { font-size: 20px; font-weight: 800; color: #FFFFFF; }
+.charge-rate { font-size: 11px; color: #8E8E93; }
+.charge-sub { font-size: 11px; color: #8E8E93; }
 
 /* ── Restore button ── */
 #restore-btn {
@@ -320,6 +345,7 @@ def _read_sys_battery():
 
 def _read_upower_history():
     all_entries = []
+    unknown_entries = []
     for fpath in glob.glob('/var/lib/upower/history-charge-*.dat'):
         try:
             with open(fpath) as f:
@@ -333,6 +359,16 @@ def _read_upower_history():
                             ts  = int(parts[0])
                             val = float(parts[1])
                             state = parts[2].strip()
+                            # upowerd occasionally logs bogus 'unknown' rows that
+                            # aren't real state transitions; keep them out of
+                            # session parsing so they don't split a session that's
+                            # actually still discharging.
+                            if state == 'unknown':
+                                unknown_entries.append({
+                                    'ts': ts, 'val': val, 'state': state,
+                                    'source_file': os.path.basename(fpath)
+                                })
+                                continue
                             all_entries.append({
                                 'ts': ts, 'val': val, 'state': state,
                                 'dt': datetime.datetime.fromtimestamp(ts)
@@ -341,10 +377,25 @@ def _read_upower_history():
                             pass
         except (IOError, PermissionError):
             pass
+    if unknown_entries:
+        def _key(e):
+            return (e['ts'], e['val'], e['state'], e['source_file'])
+        saved = load_unknown_states()
+        seen = {_key(e) for e in saved}
+        new = []
+        for e in unknown_entries:
+            k = _key(e)
+            if k not in seen:
+                seen.add(k)
+                new.append(e)
+        if new:
+            saved.extend(new)
+            saved.sort(key=lambda e: e['ts'])
+            save_unknown_states(saved)
     if not all_entries:
-        return None
+        return [], None
     all_entries.sort(key=lambda x: x['ts'])
-    return _extract_sessions(all_entries)
+    return _extract_sessions(all_entries), _extract_charging_session(all_entries)
 
 def _extract_sessions(entries):
     sessions = []
@@ -386,6 +437,37 @@ def _extract_sessions(entries):
             sessions.append(s)
 
     return sessions
+
+def _extract_charging_session(entries):
+    """Returns the current in-progress charging streak — the contiguous run
+    of 'charging' entries at the tail of the (sorted) log — or None if the
+    device isn't currently charging or upowerd hasn't logged enough of it
+    yet. Mirrors the 'active' discharge-session recency check above."""
+    if not entries or entries[-1]['state'] != 'charging':
+        return None
+    if time.time() - entries[-1]['ts'] >= 1800:
+        return None
+
+    pts = []
+    for e in reversed(entries):
+        if e['state'] != 'charging':
+            break
+        pts.append(e)
+    pts.reverse()
+    if len(pts) < 2:
+        return None
+
+    start, end = pts[0], pts[-1]
+    duration_h = (end['ts'] - start['ts']) / 3600
+    if duration_h <= 0:
+        return None
+    rate = (end['val'] - start['val']) / duration_h
+
+    return {
+        'start': start['dt'], 'start_ts': start['ts'],
+        'start_pct': round(start['val']), 'current_pct': round(end['val']),
+        'points': pts, 'duration_h': duration_h, 'rate_pct_per_h': rate,
+    }
 
 def _finalize(s):
     pts   = s['points']
@@ -474,6 +556,26 @@ def get_battery_info():
     }
 
 
+# ── Unknown-state entries persistence ─────────────────────────────────────────
+# upowerd occasionally logs bogus rows (val=0, state='unknown') that aren't
+# real charge/discharge transitions. They're dropped from session parsing
+# (see _read_upower_history) but kept here in case the raw data is ever
+# useful for debugging upowerd behaviour.
+
+def load_unknown_states():
+    try:
+        with open(UNKNOWN_STATES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_unknown_states(entries):
+    try:
+        with open(UNKNOWN_STATES_FILE, 'w') as f:
+            json.dump(entries, f, indent=2)
+    except Exception:
+        pass
+
 # ── Hidden sessions persistence ───────────────────────────────────────────────
 
 def load_hidden_ts():
@@ -521,15 +623,14 @@ def _fig_to_pixbuf(fig, dpi=150, tight=True):
 
 def _smart_xticks(ax, max_h):
     # Smaller candidates matter for a freshly-started active session, which
-    # might only have ~1 hour (or less) of data — without them, nothing in
-    # the list satisfies the ratio check below and it silently fell through
-    # to a 24h step, producing a single meaningless "0h, 24h" tick pair.
+    # might only have ~1 hour (or less) of data. Pick whichever step lands
+    # the tick count closest to the middle of a 4-9 tick sweet spot, rather
+    # than the first exact match — consecutive candidates' [4,9]-tick windows
+    # don't all overlap (e.g. 0.1h and 0.25h leave a gap around 0.9-1.0h), so
+    # "first match, else 24h" used to silently fall through to a useless
+    # single "0h, 24h" tick pair for durations landing in one of those gaps.
     nice = [0.05, 0.1, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 24]
-    step = nice[-1]
-    for s in nice:
-        if 4 <= max_h / s <= 9:
-            step = s
-            break
+    step = min(nice, key=lambda s: abs(max_h / s - 6))
     ticks = np.arange(0, max_h + step, step)
     ax.set_xticks(ticks)
     ax.set_xticklabels([f'{x:.0f}h' if x == int(x) else f'{x:.1f}h' for x in ticks],
@@ -730,6 +831,24 @@ def make_sparkline_pixbuf(session, dpi=120):
     loader.close()
     return loader.get_pixbuf()
 
+def make_charging_pixbuf(charging, dpi=150):
+    pts = charging['points']
+    xs  = [(p['ts'] - pts[0]['ts']) / 3600 for p in pts]
+    ys  = [p['val'] for p in pts]
+
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))
+    _style_ax(ax, fig)
+    ax.set_xlim(min(xs) - 0.02, max(xs) + 0.02)
+    ax.set_ylim(max(0, min(ys) - 5), min(100, max(ys) + 5))
+    ax.fill_between(xs, ys, alpha=0.2, color=GREAT, zorder=3)
+    ax.plot(xs, ys, color=GREAT, linewidth=2.5, solid_capstyle='round', zorder=5)
+    ax.plot(xs[-1], ys[-1], 'o', color=GREAT, markersize=7, zorder=6)
+    _smart_xticks(ax, max(xs) or 0.1)
+    plt.tight_layout(pad=0.4)
+    pb = _fig_to_pixbuf(fig, dpi)
+    plt.close(fig)
+    return pb
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -890,6 +1009,8 @@ class BatteryLensWindow(Gtk.Window):
         self._hidden_ts    = load_hidden_ts()
         self._hidden_idxs  = set()
         self._selected_idx = None
+        self._charging          = None
+        self._charging_selected = False
         self._bat_info     = None
         self._had_active   = False
         self._resize_debounce_id = None
@@ -905,9 +1026,18 @@ class BatteryLensWindow(Gtk.Window):
         if self._selected_idx is None and self._visible_sessions():
             self._switch_tab('overview')
 
-        # Auto-refresh every 60s when there's an active session, or when the
-        # OS reports discharging even though upowerd hasn't logged it yet
-        GLib.timeout_add_seconds(60, self._auto_refresh)
+        # Primary refresh trigger: UPower emits a D-Bus signal the instant
+        # the kernel reports a power-supply change (plugged in, unplugged,
+        # charge state flips), so we react immediately instead of waiting
+        # for the next poll. Falls back to poll-only if unavailable.
+        self._live_refresh_debounce_id = None
+        self._setup_live_power_signals()
+
+        # Fallback safety net in case the D-Bus subscription above never
+        # came up (unusual sandboxes, upowerd restarting mid-session) or a
+        # signal gets missed — much less frequent now that it's not the
+        # primary mechanism.
+        GLib.timeout_add_seconds(300, self._auto_refresh)
 
         # Re-render charts if the display's scale factor changes (e.g. moving
         # to a different-DPI monitor) or the window is resized/tiled, so
@@ -988,6 +1118,8 @@ class BatteryLensWindow(Gtk.Window):
         sidebar.pack_start(stats_box, False, False, 0)
         sidebar.pack_start(_separator(), False, False, 0)
 
+        sidebar.pack_start(self._build_charging_card(), False, False, 0)
+
         # Section label
         sec = _label('Charge Sessions', 'section-header')
         sidebar.pack_start(sec, False, False, 0)
@@ -1016,6 +1148,47 @@ class BatteryLensWindow(Gtk.Window):
         sidebar.pack_end(restore_footer, False, False, 0)
 
         return sidebar
+
+    def _build_charging_card(self):
+        """Temporary card that appears above the session list while plugged
+        in and charging, and disappears again once back on battery — mirrors
+        the shape of a session-row card but is never written to history."""
+        btn = Gtk.Button()
+        btn.get_style_context().add_class('charging-card')
+        btn.set_hexpand(True)
+        btn.connect('clicked', lambda _b: self._show_charging_detail())
+
+        inner = _box(spacing=4)
+
+        badge = _label('⚡ CHARGING', 'charge-badge')
+        badge.set_halign(Gtk.Align.START)
+        inner.pack_start(badge, False, False, 0)
+
+        row = _box(Gtk.Orientation.HORIZONTAL, 6)
+        self._charge_pct_lbl = _label('—', 'charge-pct')
+        self._charge_rate_lbl = _label('', 'charge-rate')
+        self._charge_rate_lbl.set_halign(Gtk.Align.END)
+        self._charge_rate_lbl.set_hexpand(True)
+        row.pack_start(self._charge_pct_lbl, False, False, 0)
+        row.pack_start(self._charge_rate_lbl, True, True, 0)
+        inner.pack_start(row, False, False, 0)
+
+        self._charge_sub_lbl = _label('', 'charge-sub')
+        self._charge_sub_lbl.set_xalign(0)
+        self._charge_sub_lbl.set_line_wrap(True)
+        inner.pack_start(self._charge_sub_lbl, False, False, 0)
+
+        btn.add(inner)
+
+        self._charging_revealer = Gtk.Revealer()
+        self._charging_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._charging_revealer.set_transition_duration(220)
+        self._charging_revealer.set_reveal_child(False)
+        self._charging_revealer.add(btn)
+        self._charging_revealer.set_margin_start(8)
+        self._charging_revealer.set_margin_end(8)
+        self._charging_revealer.set_margin_bottom(6)
+        return self._charging_revealer
 
     def _small_stat(self, val, lbl, tooltip=None):
         box = _box(spacing=1)
@@ -1059,6 +1232,7 @@ class BatteryLensWindow(Gtk.Window):
 
         self._stack.add_named(self._build_overview_page(),  'overview')
         self._stack.add_named(self._build_detail_page(),    'detail')
+        self._stack.add_named(self._build_charging_page(),  'charging')
         self._stack.add_named(self._build_empty_page(),     'empty')
 
         self._stack.set_visible_child_name('empty')
@@ -1351,6 +1525,70 @@ class BatteryLensWindow(Gtk.Window):
         box.pack_start(sw, True, True, 0)
         return box
 
+    # ── CHARGING PAGE (temporary, live-only) ────────────────────────────────
+
+    def _build_charging_page(self):
+        box = _box(spacing=0)
+
+        header = _box(Gtk.Orientation.HORIZONTAL, 16)
+        header.set_name('detail-header')
+        icon = _label('⚡', xalign=0.5)
+        icon.set_halign(Gtk.Align.CENTER)
+        header.pack_start(icon, False, False, 0)
+
+        text_box = _box(spacing=2)
+        title = _label('Charging', css_class=None)
+        title.set_name('detail-title')
+        title.set_xalign(0)
+        _set_color(title, GREAT)
+        self._charging_subtitle = _label('', css_class=None)
+        self._charging_subtitle.set_name('detail-subtitle')
+        self._charging_subtitle.set_xalign(0)
+        self._charging_subtitle.set_line_wrap(True)
+        text_box.pack_start(title, False, False, 0)
+        text_box.pack_start(self._charging_subtitle, False, False, 0)
+        header.pack_start(text_box, True, True, 0)
+        box.pack_start(header, False, False, 0)
+
+        sw = _scrolled()
+        body = _box(spacing=0)
+        body.set_margin_start(24)
+        body.set_margin_end(24)
+        body.set_margin_top(16)
+        body.set_margin_bottom(20)
+
+        grid = Gtk.Grid()
+        grid.set_column_homogeneous(True)
+        self._charging_pct_card  = self._make_stat_card('—', 'Current charge', color=GREAT)
+        self._charging_rate_card = self._make_stat_card('—', 'Charge rate')
+        self._charging_eta_card  = self._make_stat_card('—', 'Time to full')
+        grid.attach(self._charging_pct_card,  0, 0, 1, 1)
+        grid.attach(self._charging_rate_card, 1, 0, 1, 1)
+        grid.attach(self._charging_eta_card,  2, 0, 1, 1)
+        body.pack_start(grid, False, False, 4)
+
+        self._charging_chart_card = _box(spacing=4)
+        self._charging_chart_card.get_style_context().add_class('chart-card')
+        self._charging_chart_card.set_margin_top(8)
+        self._charging_chart_card.pack_start(
+            _label('Charge % over time (live)', 'chart-label'), False, False, 0)
+        self._charging_chart_image = Gtk.Image()
+        self._charging_chart_card.pack_start(
+            _capped_image_wrapper(self._charging_chart_image), False, False, 0)
+        body.pack_start(self._charging_chart_card, False, False, 4)
+
+        note = _label(
+            "This card is temporary — it disappears once you unplug and "
+            "isn't saved to session history.", 'sleep-note')
+        note.set_line_wrap(True)
+        note.set_xalign(0)
+        note.set_margin_top(8)
+        body.pack_start(note, False, False, 0)
+
+        sw.add(body)
+        box.pack_start(sw, True, True, 0)
+        return box
+
     # ── EMPTY PAGE ────────────────────────────────────────────────────────────
 
     def _build_empty_page(self):
@@ -1441,17 +1679,27 @@ class BatteryLensWindow(Gtk.Window):
 
     def _load_data(self):
         """Load sessions and battery info, then refresh UI."""
-        self._sessions    = _read_upower_history() or []
+        self._sessions, self._charging = _read_upower_history()
         self._bat_info    = get_battery_info()
         self._hidden_idxs = resolve_hidden_idxs(self._sessions, self._hidden_ts)
         self._refresh_sidebar()
         self._refresh_overview()
+        self._refresh_charging_card()
 
         active_s = next((s for s in self._sessions if s.get('active')), None)
         had_active_before = self._had_active
         self._had_active = active_s is not None
 
-        if self._selected_idx is not None:
+        if self._charging_selected:
+            # Keep the live charging detail view current, or fall back to
+            # Overview the moment it's unplugged and the card disappears
+            if self._is_charging():
+                self._show_charging_detail()
+            else:
+                self._charging_selected = False
+                self._stack.set_visible_child_name('overview')
+                self._refresh_overview()
+        elif self._selected_idx is not None:
             # If the selected session is the active one, refresh its detail view too
             s = self._sessions[self._selected_idx] if self._selected_idx < len(self._sessions) else None
             if s and s.get('active'):
@@ -1462,13 +1710,59 @@ class BatteryLensWindow(Gtk.Window):
             self._show_session_detail(self._sessions.index(active_s))
         return True  # keep GLib.timeout running
 
+    # ── LIVE POWER SIGNALS (event-driven, instant plug/unplug detection) ────
+
+    def _setup_live_power_signals(self):
+        """Subscribe to UPower's D-Bus PropertiesChanged signal on the
+        battery and AC/line-power devices, so the app reacts the instant the
+        OS notices a plug/unplug or charge-state change instead of waiting
+        for the next poll. Silently does nothing if D-Bus/upowerd isn't
+        reachable (e.g. a sandboxed environment) — the _auto_refresh poll
+        timer still covers that case, just with more latency."""
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            proxy = Gio.DBusProxy.new_sync(
+                bus, Gio.DBusProxyFlags.NONE, None,
+                'org.freedesktop.UPower', '/org/freedesktop/UPower',
+                'org.freedesktop.UPower', None)
+            devices = proxy.call_sync(
+                'EnumerateDevices', None, Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+            watched = [p for p in devices if '/battery_' in p or '/line_power_' in p]
+            for path in watched:
+                bus.signal_subscribe(
+                    'org.freedesktop.UPower', 'org.freedesktop.DBus.Properties',
+                    'PropertiesChanged', path, None,
+                    Gio.DBusSignalFlags.NONE, self._on_power_signal)
+        except GLib.Error:
+            pass
+
+    def _on_power_signal(self, *_args):
+        # Debounce — a single plug/unplug can fire PropertiesChanged on
+        # several properties and/or both devices in quick succession.
+        if self._live_refresh_debounce_id is not None:
+            GLib.source_remove(self._live_refresh_debounce_id)
+        self._live_refresh_debounce_id = GLib.timeout_add(400, self._live_refresh_now)
+
+    def _live_refresh_now(self):
+        self._live_refresh_debounce_id = None
+        self._load_data()
+        return False  # one-shot
+
     def _auto_refresh(self):
-        """Called every 60s — reloads while there's an active session, or
-        while the OS reports discharging but upowerd hasn't logged it yet."""
+        """Called every 300s as a fallback safety net (the D-Bus signal
+        subscription above is the primary trigger) — reloads while there's
+        an active session, while the OS reports discharging but upowerd
+        hasn't logged it yet, or while charging (to keep the live charging
+        card current).
+
+        Checks a fresh get_battery_info() rather than the cached
+        self._bat_info — that cache is only ever updated by _load_data()
+        itself, so gating on it means a state change that happens while the
+        app is sitting idle (e.g. plugging in after being fully idle) never
+        flips the condition true and _load_data() never gets called again."""
         has_active = any(s.get('active') for s in self._sessions)
-        live_discharging = bool(self._bat_info) and \
-            self._bat_info.get('status', '').lower() == 'discharging'
-        if has_active or live_discharging:
+        live_status = (get_battery_info() or {}).get('status', '').lower()
+        if has_active or live_status in ('charging', 'discharging'):
             self._load_data()
         return True  # keep timer alive
 
@@ -1843,6 +2137,7 @@ class BatteryLensWindow(Gtk.Window):
             return
         s = self._sessions[idx]
         self._selected_idx = idx
+        self._charging_selected = False
         color = RATING_COLORS.get(
             'active' if s.get('active') else s['usage_rating'], GOOD)
 
@@ -1920,12 +2215,88 @@ class BatteryLensWindow(Gtk.Window):
 
         self._stack.set_visible_child_name('detail')
 
+    # ── CHARGING CARD (live-only, never saved to history) ───────────────────
+
+    def _is_charging(self):
+        return bool(self._bat_info) and \
+            self._bat_info.get('status', '').lower() == 'charging'
+
+    def _refresh_charging_card(self):
+        """Show/hide the sidebar's temporary charging card and keep its
+        numbers current. Called on every _load_data() refresh."""
+        if not self._is_charging():
+            self._charging_revealer.set_reveal_child(False)
+            return
+
+        self._charging_revealer.set_reveal_child(True)
+        c = self._charging
+        if c:
+            self._charge_pct_lbl.set_text(f"{c['current_pct']}%")
+            rate = c['rate_pct_per_h']
+            self._charge_rate_lbl.set_text(f"+{rate:.1f}%/hr" if rate > 0 else '')
+            mins = max(0, int((time.time() - c['start_ts']) / 60))
+            ago = f"{mins}m ago" if mins < 60 else f"{mins // 60}h {mins % 60}m ago"
+            if rate > 0 and c['current_pct'] < 100:
+                eta_h = (100 - c['current_pct']) / rate
+                self._charge_sub_lbl.set_text(f"Plugged in {ago} · full in ~{fmt_duration(eta_h)}")
+            else:
+                self._charge_sub_lbl.set_text(f"Plugged in {ago}")
+        else:
+            cap = self._bat_info.get('capacity') if self._bat_info else None
+            self._charge_pct_lbl.set_text(f"{cap}%" if cap else '—')
+            self._charge_rate_lbl.set_text('')
+            self._charge_sub_lbl.set_text('Just plugged in — gathering data…')
+
+    def _show_charging_detail(self):
+        if not self._is_charging():
+            return
+        self._selected_idx = None
+        self._charging_selected = True
+
+        c = self._charging
+        if c:
+            self._charging_subtitle.set_text(
+                f"Plugged in since {c['start'].strftime('%-I:%M %p')} · "
+                f"started at {c['start_pct']}%")
+            self._charging_pct_card._val_lbl.set_text(f"{c['current_pct']}%")
+            rate = c['rate_pct_per_h']
+            self._charging_rate_card._val_lbl.set_text(
+                f"+{rate:.1f}%/hr" if rate > 0 else '—')
+            if rate > 0 and c['current_pct'] < 100:
+                eta_h = (100 - c['current_pct']) / rate
+                self._charging_eta_card._val_lbl.set_text(f"~{fmt_duration(eta_h)}")
+            else:
+                self._charging_eta_card._val_lbl.set_text('—')
+
+            self._charging_chart_card.show()
+            chart_w = _chart_width(self._charging_chart_card)
+            def render_chart():
+                pb = make_charging_pixbuf(c, self._dpi)
+                def update():
+                    if pb:
+                        h = int(pb.get_height() * chart_w / pb.get_width())
+                        scaled = pb.scale_simple(chart_w, h, GdkPixbuf.InterpType.BILINEAR)
+                        self._charging_chart_image.set_from_pixbuf(scaled)
+                    return False
+                GLib.idle_add(update)
+            threading.Thread(target=render_chart, daemon=True).start()
+        else:
+            cap = self._bat_info.get('capacity') if self._bat_info else None
+            self._charging_subtitle.set_text('Just plugged in — gathering data…')
+            self._charging_pct_card._val_lbl.set_text(f"{cap}%" if cap else '—')
+            self._charging_rate_card._val_lbl.set_text('—')
+            self._charging_eta_card._val_lbl.set_text('—')
+            self._charging_chart_card.hide()
+
+        self._stack.set_visible_child_name('charging')
+
     # ── TAB SWITCHING ─────────────────────────────────────────────────────────
 
     def _switch_tab(self, name):
         self._tab_overview.get_style_context().add_class('tab-btn-active')
         if name == 'overview':
             self._selected_idx = None
+            self._charging_selected = False
             self._stack.set_visible_child_name('overview')
             self._refresh_overview()
 
@@ -2031,19 +2402,15 @@ class BatteryLensWindow(Gtk.Window):
                     (a['browser_download_url'] for a in assets
                      if a['name'].endswith('.sh')), None)
                 GLib.idle_add(self._show_update_result,
-                              latest, notes, installer_url, None)
+                              btn, latest, notes, installer_url, None)
             except Exception as e:
-                GLib.idle_add(self._show_update_result, None, None, None, str(e))
+                GLib.idle_add(self._show_update_result, btn, None, None, None, str(e))
 
         threading.Thread(target=check, daemon=True).start()
 
-    def _show_update_result(self, latest, notes, installer_url, error):
-        btn = None
-        for w in self._sidebar_find_update_btn():
-            btn = w
-        if btn:
-            btn.set_label('⟳ Check for updates')
-            btn.set_sensitive(True)
+    def _show_update_result(self, btn, latest, notes, installer_url, error):
+        btn.set_label('⟳ Check for updates')
+        btn.set_sensitive(True)
 
         if error:
             self._show_dialog('Update check failed',
@@ -2138,18 +2505,6 @@ class BatteryLensWindow(Gtk.Window):
                 GLib.idle_add(self._show_dialog, 'Update failed', str(e))
 
         threading.Thread(target=do_update, daemon=True).start()
-
-    def _sidebar_find_update_btn(self):
-        # Helper to find the update button in the sidebar header
-        results = []
-        def walk(w):
-            if isinstance(w, Gtk.Button) and 'update' in (w.get_label() or '').lower():
-                results.append(w)
-            if hasattr(w, 'get_children'):
-                for c in w.get_children():
-                    walk(c)
-        walk(self._paned.get_child1())
-        return results
 
     def _show_dialog(self, title, message):
         dialog = Gtk.MessageDialog(
