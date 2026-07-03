@@ -1160,9 +1160,9 @@ class BatteryLensWindow(Gtk.Window):
 
         inner = _box(spacing=4)
 
-        badge = _label('⚡ CHARGING', 'charge-badge')
-        badge.set_halign(Gtk.Align.START)
-        inner.pack_start(badge, False, False, 0)
+        self._charge_badge_lbl = _label('⚡ CHARGING', 'charge-badge')
+        self._charge_badge_lbl.set_halign(Gtk.Align.START)
+        inner.pack_start(self._charge_badge_lbl, False, False, 0)
 
         row = _box(Gtk.Orientation.HORIZONTAL, 6)
         self._charge_pct_lbl = _label('—', 'charge-pct')
@@ -1537,15 +1537,15 @@ class BatteryLensWindow(Gtk.Window):
         header.pack_start(icon, False, False, 0)
 
         text_box = _box(spacing=2)
-        title = _label('Charging', css_class=None)
-        title.set_name('detail-title')
-        title.set_xalign(0)
-        _set_color(title, GREAT)
+        self._charging_title = _label('Charging', css_class=None)
+        self._charging_title.set_name('detail-title')
+        self._charging_title.set_xalign(0)
+        _set_color(self._charging_title, GREAT)
         self._charging_subtitle = _label('', css_class=None)
         self._charging_subtitle.set_name('detail-subtitle')
         self._charging_subtitle.set_xalign(0)
         self._charging_subtitle.set_line_wrap(True)
-        text_box.pack_start(title, False, False, 0)
+        text_box.pack_start(self._charging_title, False, False, 0)
         text_box.pack_start(self._charging_subtitle, False, False, 0)
         header.pack_start(text_box, True, True, 0)
         box.pack_start(header, False, False, 0)
@@ -1762,7 +1762,7 @@ class BatteryLensWindow(Gtk.Window):
         flips the condition true and _load_data() never gets called again."""
         has_active = any(s.get('active') for s in self._sessions)
         live_status = (get_battery_info() or {}).get('status', '').lower()
-        if has_active or live_status in ('charging', 'discharging'):
+        if has_active or live_status in ('charging', 'discharging', 'not charging'):
             self._load_data()
         return True  # keep timer alive
 
@@ -2218,8 +2218,48 @@ class BatteryLensWindow(Gtk.Window):
     # ── CHARGING CARD (live-only, never saved to history) ───────────────────
 
     def _is_charging(self):
-        return bool(self._bat_info) and \
-            self._bat_info.get('status', '').lower() == 'charging'
+        """True whenever AC is connected and the battery is being actively
+        managed — covers both 'charging' and 'not charging'. The kernel only
+        reports 'not charging' while a charger is present but paused (a
+        charge-limit/battery-saver cap, thermal throttling, calibration,
+        etc.) — a genuine unplug always reports 'discharging' instead, so
+        this never mistakes "actually unplugged" for "still connected"."""
+        if not self._bat_info:
+            return False
+        return self._bat_info.get('status', '').lower() in ('charging', 'not charging')
+
+    def _charging_display(self):
+        """Badge/pct/rate/sub/eta text for the current live charging state,
+        shared by the sidebar card and the detail page so their wording
+        can't drift apart. Three cases: actively charging with upower-log
+        data to compute a rate from; just plugged in with no log data yet;
+        or paused/holding (e.g. at a charge-saver cap) with AC still
+        connected but the kernel reporting 'not charging'."""
+        cap = (self._bat_info or {}).get('capacity')
+        status = (self._bat_info or {}).get('status', '').lower()
+        c = self._charging
+
+        if c:
+            pct = f"{c['current_pct']}%"
+            rate = c['rate_pct_per_h']
+            rate_text = f"+{rate:.1f}%/hr" if rate > 0 else ''
+            mins = max(0, int((time.time() - c['start_ts']) / 60))
+            ago = f"{mins}m ago" if mins < 60 else f"{mins // 60}h {mins % 60}m ago"
+            if rate > 0 and c['current_pct'] < 100:
+                eta_h = (100 - c['current_pct']) / rate
+                eta = f"~{fmt_duration(eta_h)}"
+                sub = f"Plugged in {ago} · full in {eta}"
+            else:
+                eta = '—'
+                sub = f"Plugged in {ago}"
+            return dict(badge='⚡ CHARGING', pct=pct, rate=rate_text, sub=sub, eta=eta)
+
+        pct = f"{cap}%" if cap else '—'
+        if status == 'not charging':
+            return dict(badge='⏸ PLUGGED IN', pct=pct, rate='',
+                        sub=f"Holding at {pct} — not currently charging", eta='—')
+        return dict(badge='⚡ CHARGING', pct=pct, rate='',
+                    sub='Just plugged in — gathering data…', eta='—')
 
     def _refresh_charging_card(self):
         """Show/hide the sidebar's temporary charging card and keep its
@@ -2229,23 +2269,11 @@ class BatteryLensWindow(Gtk.Window):
             return
 
         self._charging_revealer.set_reveal_child(True)
-        c = self._charging
-        if c:
-            self._charge_pct_lbl.set_text(f"{c['current_pct']}%")
-            rate = c['rate_pct_per_h']
-            self._charge_rate_lbl.set_text(f"+{rate:.1f}%/hr" if rate > 0 else '')
-            mins = max(0, int((time.time() - c['start_ts']) / 60))
-            ago = f"{mins}m ago" if mins < 60 else f"{mins // 60}h {mins % 60}m ago"
-            if rate > 0 and c['current_pct'] < 100:
-                eta_h = (100 - c['current_pct']) / rate
-                self._charge_sub_lbl.set_text(f"Plugged in {ago} · full in ~{fmt_duration(eta_h)}")
-            else:
-                self._charge_sub_lbl.set_text(f"Plugged in {ago}")
-        else:
-            cap = self._bat_info.get('capacity') if self._bat_info else None
-            self._charge_pct_lbl.set_text(f"{cap}%" if cap else '—')
-            self._charge_rate_lbl.set_text('')
-            self._charge_sub_lbl.set_text('Just plugged in — gathering data…')
+        d = self._charging_display()
+        self._charge_badge_lbl.set_text(d['badge'])
+        self._charge_pct_lbl.set_text(d['pct'])
+        self._charge_rate_lbl.set_text(d['rate'])
+        self._charge_sub_lbl.set_text(d['sub'])
 
     def _show_charging_detail(self):
         if not self._is_charging():
@@ -2253,21 +2281,15 @@ class BatteryLensWindow(Gtk.Window):
         self._selected_idx = None
         self._charging_selected = True
 
+        d = self._charging_display()
+        self._charging_title.set_text('Plugged In' if d['badge'].startswith('⏸') else 'Charging')
+        self._charging_subtitle.set_text(d['sub'])
+        self._charging_pct_card._val_lbl.set_text(d['pct'])
+        self._charging_rate_card._val_lbl.set_text(d['rate'] or '—')
+        self._charging_eta_card._val_lbl.set_text(d['eta'])
+
         c = self._charging
         if c:
-            self._charging_subtitle.set_text(
-                f"Plugged in since {c['start'].strftime('%-I:%M %p')} · "
-                f"started at {c['start_pct']}%")
-            self._charging_pct_card._val_lbl.set_text(f"{c['current_pct']}%")
-            rate = c['rate_pct_per_h']
-            self._charging_rate_card._val_lbl.set_text(
-                f"+{rate:.1f}%/hr" if rate > 0 else '—')
-            if rate > 0 and c['current_pct'] < 100:
-                eta_h = (100 - c['current_pct']) / rate
-                self._charging_eta_card._val_lbl.set_text(f"~{fmt_duration(eta_h)}")
-            else:
-                self._charging_eta_card._val_lbl.set_text('—')
-
             self._charging_chart_card.show()
             chart_w = _chart_width(self._charging_chart_card)
             def render_chart():
@@ -2281,11 +2303,6 @@ class BatteryLensWindow(Gtk.Window):
                 GLib.idle_add(update)
             threading.Thread(target=render_chart, daemon=True).start()
         else:
-            cap = self._bat_info.get('capacity') if self._bat_info else None
-            self._charging_subtitle.set_text('Just plugged in — gathering data…')
-            self._charging_pct_card._val_lbl.set_text(f"{cap}%" if cap else '—')
-            self._charging_rate_card._val_lbl.set_text('—')
-            self._charging_eta_card._val_lbl.set_text('—')
             self._charging_chart_card.hide()
 
         self._stack.set_visible_child_name('charging')
