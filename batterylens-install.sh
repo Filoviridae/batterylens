@@ -44,7 +44,7 @@ cat > "$APP_FILE" << 'BATTERYLENS_APP_END'
 #!/usr/bin/env python3
 """
 BatteryLens - GTK3 native battery charge history viewer
-Version: 1.1.3
+Version: 1.1.4
 Repository: https://github.com/Filoviridae/batterylens
 """
 
@@ -67,6 +67,7 @@ import urllib.request
 import urllib.error
 import io
 import base64
+from collections import Counter
 
 import matplotlib
 # Was 'cairo' — switched to the standard Agg backend after discovering it
@@ -87,7 +88,7 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 GLib.set_prgname('io.github.filoviridae.batterylens')
 GLib.set_application_name('BatteryLens')
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 REPO = "Filoviridae/batterylens"
 SLEEP_GAP_THRESHOLD_S = 900  # 15 min
 LONG_GAP_THRESHOLD_S = 86400  # 24h — beyond this, condense the gap on charts
@@ -464,9 +465,52 @@ def _read_upower_history():
     if not all_entries:
         return [], None
     all_entries.sort(key=lambda x: x['ts'])
-    return _extract_sessions(all_entries), _extract_charging_session(all_entries)
+    charge_cap = _detect_charge_cap(all_entries)
+    return _extract_sessions(all_entries, charge_cap), _extract_charging_session(all_entries)
 
-def _extract_sessions(entries):
+def _detect_charge_cap(entries):
+    """Best-effort detection of the % a charging streak actually tops out
+    at — either 100% (no limit set) or a battery-saver/charge-limit cap
+    (commonly 80%, but vendor- and user-configurable). Used to tell "still
+    plugged in, held at the limit" apart from genuine idle/off time when a
+    session's history goes silent after a charging streak — the kernel
+    reports 'not charging' while holding, and upowerd simply stops writing
+    history rows for that state, so both look identical in the log.
+
+    Tries the kernel's own reported threshold first (accurate, and picks
+    up a changed setting immediately) — only some drivers expose this, so
+    falls back to the most frequently recurring charging-streak peak in
+    history (a real cap recurs across cycles; a one-off partial or full
+    charge doesn't), defaulting to 100% if nothing recurs."""
+    for bat_path in glob.glob('/sys/class/power_supply/BAT*'):
+        for fname in ('charge_control_end_threshold', 'charge_stop_threshold'):
+            fpath = os.path.join(bat_path, fname)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath) as f:
+                        val = float(f.read().strip())
+                    if 0 < val <= 100:
+                        return val
+                except (ValueError, OSError):
+                    pass
+
+    peaks = []
+    running_peak = None
+    for e in entries:
+        if e['state'] == 'charging':
+            running_peak = e['val'] if running_peak is None else max(running_peak, e['val'])
+        elif running_peak is not None:
+            peaks.append(running_peak)
+            running_peak = None
+    if running_peak is not None:
+        peaks.append(running_peak)
+    if not peaks:
+        return 100.0
+
+    cap, freq = Counter(round(p) for p in peaks).most_common(1)[0]
+    return float(cap) if freq >= 2 else 100.0
+
+def _extract_sessions(entries, charge_cap=100.0):
     sessions = []
     current = None
     prev_entry = None
@@ -481,7 +525,7 @@ def _extract_sessions(entries):
         cur['duration_h'] = (cur['end_ts'] - cur['start_ts']) / 3600
         if cur['duration_h'] < 0.08:
             return None
-        s = _finalize(cur)
+        s = _finalize(cur, charge_cap)
         s['active'] = active
         return s
 
@@ -553,10 +597,28 @@ def _extract_charging_session(entries):
         'points': pts, 'duration_h': duration_h, 'rate_pct_per_h': rate,
     }
 
-def _finalize(s):
+def _finalize(s, charge_cap=100.0):
     pts   = s['points']
     drain = s['start_pct'] - s['end_pct']
     dur_h = s['duration_h']
+
+    # A session's first point can be a synthetic "lead" bridging back
+    # across a charging→discharging boundary (see _extract_sessions). If
+    # that lead was 'charging' and peaked at/near the detected charge
+    # limit, the gap right after it is very likely "still plugged in, held
+    # at the cap" rather than genuine idle/off time — upowerd's log can't
+    # tell these apart (both just go silent), so this is a best-effort
+    # label, not a certainty. Capped at LONG_GAP_THRESHOLD_S: a real
+    # multi-day gap ending at the cap is far more likely a genuine
+    # suspend/shutdown than someone sitting plugged in for days on end —
+    # confirmed against real data, where a 65h gap ending at 80% was a
+    # verified reboot, and a 1h49m gap ending at 80% was verified as
+    # "still at the laptop, just plugged in."
+    first_gap_at_limit = (
+        len(pts) > 1 and pts[0]['state'] != 'discharging'
+        and abs(pts[0]['val'] - charge_cap) <= 1.5
+        and (pts[1]['ts'] - pts[0]['ts']) <= LONG_GAP_THRESHOLD_S
+    )
 
     intervals = [pts[i]['ts'] - pts[i-1]['ts'] for i in range(1, len(pts))]
     active_s = 0
@@ -599,6 +661,8 @@ def _finalize(s):
         'drain_pct':   round(drain),
         'usage_rating': usage,
         'sleep_gaps':  sleep_gaps,
+        'first_gap_at_limit': first_gap_at_limit,
+        'charge_cap':  charge_cap,
         'points':      pts,
         'active':      False,
     }
@@ -2542,14 +2606,23 @@ class BatteryLensWindow(Gtk.Window):
         color = RATING_COLORS.get(
             'active' if s.get('active') else s['usage_rating'], GOOD)
 
+        # first_gap_at_limit means the session's leading gap is most likely
+        # "still plugged in, held at the charge cap" rather than genuine
+        # idle/off time (see _detect_charge_cap) — used below by the
+        # header, sleep note, and badge so their wording can't disagree.
+        at_limit = s.get('first_gap_at_limit', False)
+        sleep_gaps = s.get('sleep_gaps', [])
+        ordinary_sleep_count = len(sleep_gaps) - (1 if at_limit else 0)
+
         # Header
         active_h = s.get('active_h', s['duration_h'])
         idle_h   = max(0, s['duration_h'] - active_h)
+        idle_label = 'plugged in' if (at_limit and ordinary_sleep_count == 0) else 'idle'
         self._detail_title.set_markup(
             f'<span color="{color}" weight="heavy" size="x-large">{fmt_duration(active_h)}</span>'
             f'<span size="small" color="{SUBTEXT}"> screen on</span>'
             f'   <span color="{SUBTEXT}" weight="heavy" size="x-large">{fmt_duration(idle_h)}</span>'
-            f'<span size="small" color="{SUBTEXT}"> idle</span>')
+            f'<span size="small" color="{SUBTEXT}"> {idle_label}</span>')
 
         # Date string
         if s['start'].date() != s['end'].date():
@@ -2565,21 +2638,36 @@ class BatteryLensWindow(Gtk.Window):
         else:
             self._detail_lag_note.hide()
 
-        # Sleep note
-        sleep_count = len(s.get('sleep_gaps', []))
-        if sleep_count > 0:
-            note = (f'{sleep_count} sleep period{"s" if sleep_count > 1 else ""} detected.  '
-                    f'Full-charge equivalent calculated from active time only.')
+        # Sleep note — the session's first gap doesn't count as a "sleep
+        # period" if it's most likely just still plugged in and held at
+        # the charge limit (see first_gap_at_limit / _detect_charge_cap),
+        # since that's normal plugged-in time, not idle/screen-off time.
+        limit_pct = round(sleep_gaps[0][2]) if at_limit else None
+        parts = []
+        if at_limit:
+            parts.append(f'Held at {limit_pct}% charge limit for part of this session')
+        if ordinary_sleep_count > 0:
+            parts.append(f'{ordinary_sleep_count} sleep period'
+                          f'{"s" if ordinary_sleep_count > 1 else ""} detected')
+        if parts:
+            note = '.  '.join(parts) + '.  Full-charge equivalent calculated from active time only.'
             self._sleep_note.set_text(note)
             self._sleep_note_box.show_all()
         else:
             self._sleep_note_box.hide()
 
-        # Long-idle badge — the largest 24h+ gap, if any (mirrors the
-        # condensing done on the chart itself in make_detail_pixbuf).
-        long_gaps = [g for g in s.get('sleep_gaps', [])
-                     if g[1] - g[0] > LONG_GAP_THRESHOLD_S]
-        if long_gaps:
+        # Long-idle badge — the largest 24h+ gap (mirrors the condensing
+        # done on the chart itself in make_detail_pixbuf), or the first
+        # gap regardless of length when it's a charge-limit hold, since
+        # that's worth surfacing even when short.
+        long_gaps = [g for g in sleep_gaps if g[1] - g[0] > LONG_GAP_THRESHOLD_S]
+        if at_limit:
+            ts_prev, ts_next, val_prev = sleep_gaps[0]
+            gap_h = (ts_next - ts_prev) / 3600
+            self._detail_gap_badge.set_text(
+                f'↳ resumed after {_fmt_gap_duration(gap_h)} · held at {round(val_prev)}% charge limit')
+            self._detail_gap_badge_box.show_all()
+        elif long_gaps:
             ts_prev, ts_next, val_prev = max(long_gaps, key=lambda g: g[1] - g[0])
             gap_h = (ts_next - ts_prev) / 3600
             self._detail_gap_badge.set_text(
