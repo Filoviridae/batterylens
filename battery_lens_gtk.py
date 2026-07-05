@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BatteryLens - GTK3 native battery charge history viewer
-Version: 1.1.2
+Version: 1.1.3
 Repository: https://github.com/Filoviridae/batterylens
 """
 
@@ -26,11 +26,16 @@ import io
 import base64
 
 import matplotlib
-matplotlib.use('cairo')
+# Was 'cairo' — switched to the standard Agg backend after discovering it
+# silently drops FancyBboxPatch corner rounding (used for the bar-chart
+# style) while rendering everything else identically. All chart output
+# already went through _fig_to_pixbuf's plain fig.savefig(..., format='png'),
+# so this is a drop-in swap, not a behavior change for anything else.
+matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.transforms as mtransforms
 import numpy as np
-from matplotlib.backends.backend_cairo import FigureCanvasCairo, RendererCairo
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 # Must match the installed .desktop file's basename so GNOME Shell (Wayland
@@ -39,14 +44,20 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 GLib.set_prgname('io.github.filoviridae.batterylens')
 GLib.set_application_name('BatteryLens')
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 REPO = "Filoviridae/batterylens"
 SLEEP_GAP_THRESHOLD_S = 900  # 15 min
+LONG_GAP_THRESHOLD_S = 86400  # 24h — beyond this, condense the gap on charts
+LONG_GAP_DISPLAY_H = 0.12     # fixed on-chart width given to any condensed gap
 
 APP_DIR   = os.path.expanduser('~/.local/share/batterylens')
 HIDDEN_FILE = os.path.join(APP_DIR, 'hidden_sessions.json')
 UNKNOWN_STATES_FILE = os.path.join(APP_DIR, 'unknown_states.json')
+CHART_PREFS_FILE = os.path.join(APP_DIR, 'chart_prefs.json')
 ICON_PATH   = os.path.join(APP_DIR, 'batterylens-icon.png')
+
+DEFAULT_CHART_PREF = {'style': 'line', 'granularity_h': 1}
+GRANULARITY_CHOICES_H = (1, 2, 4)
 
 # ── Colour palette (matches original dark theme) ─────────────────────────────
 BG      = '#1C1C1E'
@@ -287,6 +298,21 @@ dialog box, messagedialog box { background-color: #2C2C2E; }
 }
 .chart-label { font-size: 11px; font-weight: 600; color: #8E8E93; margin-bottom: 8px; }
 
+/* ── Chart style / granularity toggle buttons ── */
+.style-toggle {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    margin: 0;
+    min-height: 0;
+    min-width: 0;
+    border-radius: 6px;
+}
+.style-toggle-active {
+    background-color: rgba(0,122,255,0.15);
+    color: #007AFF;
+}
+
 /* ── Overview battery strip ── */
 .bat-strip {
     background-color: #2C2C2E;
@@ -400,6 +426,7 @@ def _read_upower_history():
 def _extract_sessions(entries):
     sessions = []
     current = None
+    prev_entry = None
 
     def _close(cur, active=False):
         if not cur or len(cur['points']) < 2:
@@ -420,6 +447,19 @@ def _extract_sessions(entries):
             if current is None:
                 current = {'start': e['dt'], 'start_ts': e['ts'],
                            'start_pct': e['val'], 'points': [e]}
+                # A long gap since the last log entry of any kind (lid
+                # closed, machine off/suspended) sits between sessions and
+                # would otherwise be lost entirely. Bridge it with the real
+                # prior reading so the sleep-gap logic in _finalize picks it
+                # up automatically — extending duration/idle and drawing the
+                # true drop on the chart, without touching active_drain.
+                if prev_entry is not None and e['ts'] - prev_entry['ts'] > SLEEP_GAP_THRESHOLD_S:
+                    lead = {'ts': prev_entry['ts'], 'val': prev_entry['val'],
+                            'dt': prev_entry['dt'], 'state': prev_entry['state']}
+                    current['points'].insert(0, lead)
+                    current['start']    = lead['dt']
+                    current['start_ts'] = lead['ts']
+                    current['start_pct'] = lead['val']
             else:
                 current['points'].append(e)
         else:
@@ -427,6 +467,7 @@ def _extract_sessions(entries):
             if s:
                 sessions.append(s)
             current = None
+        prev_entry = e
 
     if current and len(current['points']) >= 2:
         last = current['points'][-1]
@@ -476,19 +517,25 @@ def _finalize(s):
 
     intervals = [pts[i]['ts'] - pts[i-1]['ts'] for i in range(1, len(pts))]
     active_s = 0
+    active_drain = 0
     sleep_gaps = []
     for i in range(1, len(pts)):
         gap = pts[i]['ts'] - pts[i-1]['ts']
         if gap > SLEEP_GAP_THRESHOLD_S:
-            sleep_gaps.append((pts[i-1]['ts'], pts[i]['ts']))
+            sleep_gaps.append((pts[i-1]['ts'], pts[i]['ts'], pts[i-1]['val']))
         else:
             active_s += gap
+            active_drain += pts[i-1]['val'] - pts[i]['val']
     active_h = active_s / 3600
 
-    if drain > 0 and active_h > 0:
-        full_equiv_h = active_h * (100 / drain)
-    elif drain > 0:
-        full_equiv_h = dur_h * (100 / drain)
+    # Rating/projection is defined (see FULL_EQUIV_TOOLTIP) as the rate
+    # observed during active/screen-on time — use active_drain, not the
+    # whole-session drain, so a long sleep/off gap (which can lose many
+    # percentage points with zero real usage) never skews it.
+    if active_drain > 0 and active_h > 0:
+        full_equiv_h = active_h * (100 / active_drain)
+    elif active_drain > 0:
+        full_equiv_h = dur_h * (100 / active_drain)
     else:
         full_equiv_h = active_h or dur_h
 
@@ -599,6 +646,28 @@ def resolve_hidden_idxs(sessions, hidden_ts):
             result.add(i)
     return result
 
+# ── Per-session chart style persistence ───────────────────────────────────────
+# Keyed by session start_ts (same identity used for hidden sessions) so a
+# session keeps its line/bar + granularity choice across app restarts even
+# though sessions are re-derived from the raw upower log every launch.
+
+def load_chart_prefs():
+    try:
+        with open(CHART_PREFS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_chart_prefs(prefs):
+    try:
+        with open(CHART_PREFS_FILE, 'w') as f:
+            json.dump(prefs, f, indent=2)
+    except Exception:
+        pass
+
+def get_chart_pref(prefs, session):
+    return prefs.get(str(int(session['start_ts'])), DEFAULT_CHART_PREF)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHART LAYER  (matplotlib → Cairo surface → Gtk.DrawingArea)
@@ -621,7 +690,33 @@ def _fig_to_pixbuf(fig, dpi=150, tight=True):
     loader.close()
     return loader.get_pixbuf()
 
-def _smart_xticks(ax, max_h):
+def _compress_xs(pts):
+    """Map each point to an on-chart x position in hours, collapsing any
+    gap longer than LONG_GAP_THRESHOLD_S (e.g. the machine off/suspended
+    for days) down to a small fixed width — otherwise a multi-day gap
+    stretches the axis so far that the real (often much shorter) active
+    portion of the session gets squashed into an unreadable sliver. The
+    true skipped duration is still conveyed via a text annotation drawn
+    over the condensed segment (see _draw_discharge_line), not its width.
+
+    Returns (xs, breaks) where breaks is a list of (disp_x_start,
+    disp_x_end, real_start_h, real_end_h) for each condensed gap.
+    """
+    xs = [0.0]
+    breaks = []
+    for i in range(1, len(pts)):
+        gap_s = pts[i]['ts'] - pts[i-1]['ts']
+        real_h = (pts[i]['ts'] - pts[0]['ts']) / 3600
+        if gap_s > LONG_GAP_THRESHOLD_S:
+            disp = xs[-1] + LONG_GAP_DISPLAY_H
+            real_prev_h = (pts[i-1]['ts'] - pts[0]['ts']) / 3600
+            breaks.append((xs[-1], disp, real_prev_h, real_h))
+        else:
+            disp = xs[-1] + gap_s / 3600
+        xs.append(disp)
+    return xs, breaks
+
+def _smart_xticks(ax, xs, pts=None, breaks=None, max_h=None):
     # Smaller candidates matter for a freshly-started active session, which
     # might only have ~1 hour (or less) of data. Pick whichever step lands
     # the tick count closest to the middle of a 4-9 tick sweet spot, rather
@@ -630,11 +725,72 @@ def _smart_xticks(ax, max_h):
     # "first match, else 24h" used to silently fall through to a useless
     # single "0h, 24h" tick pair for durations landing in one of those gaps.
     nice = [0.05, 0.1, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 24]
-    step = min(nice, key=lambda s: abs(max_h / s - 6))
-    ticks = np.arange(0, max_h + step, step)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f'{x:.0f}h' if x == int(x) else f'{x:.1f}h' for x in ticks],
-                       color=SUBTEXT, fontsize=8)
+    disp_max = max_h if max_h is not None else (xs[-1] if xs else 0)
+    # matplotlib silently widens the axis to fit any tick outside the current
+    # xlim (confirmed: set_xticks([x]) with x > xlim[1] moves xlim[1] to x) —
+    # so an off-by-one tick past disp_max doesn't just look odd, it blows the
+    # compressed axis back out to whatever that stray tick's position was.
+    # Every candidate list below must be hard-clipped to disp_max.
+    eps = 1e-9
+
+    if not breaks:
+        step = min(nice, key=lambda s: abs(disp_max / s - 6))
+        ticks = [t for t in np.arange(0, disp_max + step, step) if t <= disp_max + eps]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f'{x:.0f}h' if x == int(x) else f'{x:.1f}h' for x in ticks],
+                           color=SUBTEXT, fontsize=8)
+        return
+
+    # One or more gaps were condensed, so a single global step (picked from
+    # the mostly-condensed real duration) is the wrong tool — it's either
+    # so coarse the real (usually short) active portion gets zero ticks, or
+    # it lands candidates inside the condensed span with nowhere sane to put
+    # them. Instead, tick each contiguous "run" between condensed gaps on
+    # its own scale: real hours map 1:1 to display hours *within* a run (by
+    # construction of _compress_xs), so each run gets exactly the same
+    # nice-step treatment as an uncondensed chart, just offset to where that
+    # run actually sits.
+    real_last_h = (pts[-1]['ts'] - pts[0]['ts']) / 3600
+    real_max_h = real_last_h + max(0, disp_max - xs[-1])
+
+    runs = []  # (real_start_h, real_end_h, disp_start, disp_end)
+    real_cursor, disp_cursor = 0.0, 0.0
+    for disp_start, disp_end, real_start_h, real_end_h in breaks:
+        runs.append((real_cursor, real_start_h, disp_cursor, disp_start))
+        real_cursor, disp_cursor = real_end_h, disp_end
+    runs.append((real_cursor, real_max_h, disp_cursor, disp_max))
+
+    tick_positions, tick_labels = [], []
+    seen = set()
+    for real_start_h, real_end_h, disp_start, disp_end in runs:
+        span = real_end_h - real_start_h
+        if span <= eps:
+            candidates = [real_start_h]
+        else:
+            step = min(nice, key=lambda s: abs(span / s - 6))
+            lo = math.floor((real_start_h - eps) / step) * step
+            candidates = [c for c in np.arange(lo, real_end_h + step, step)
+                          if real_start_h - eps <= c <= real_end_h + eps]
+        for c in candidates:
+            frac = (c - real_start_h) / span if span > eps else 0
+            d = disp_start + frac * (disp_end - disp_start)
+            if d > disp_max + eps:
+                continue
+            key = round(d, 4)
+            if key in seen:
+                continue
+            seen.add(key)
+            tick_positions.append(d)
+            tick_labels.append(f'{c:.0f}h' if c == int(c) else f'{c:.1f}h')
+
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, color=SUBTEXT, fontsize=8)
+
+def _fmt_gap_duration(hours):
+    d, h = int(hours // 24), int(hours % 24)
+    if d > 0:
+        return f'{d}d {h}h' if h else f'{d}d'
+    return fmt_duration(hours)
 
 def _style_ax(ax, fig):
     ax.set_facecolor(BG2)
@@ -691,6 +847,20 @@ def _draw_discharge_line(ax, pts, xs, ys, color, show_points=False):
                     color=SLEEP_LINE, linewidth=1.5, linestyle='--',
                     alpha=0.7, zorder=4, label=lbl, **point_kwargs)
             first_sleep = False
+            if gap > LONG_GAP_THRESHOLD_S:
+                # Condensed on the x-axis (see _compress_xs) to a near-zero
+                # width — the actual duration is shown in a badge above the
+                # chart (_show_session_detail), not here. This just marks the
+                # break as a long sleep with the same moon glyph, so it reads
+                # as "more of the same, just longer" rather than a new symbol.
+                mid_x = (xs[i-1] + xs[i]) / 2
+                moon_y = min(max(ys[i-1], ys[i]) + 4, 97)
+                offset_t = mtransforms.offset_copy(
+                    ax.transData, fig=ax.figure, x=2.2, y=2.6, units='points')
+                ax.scatter([mid_x], [moon_y], s=46, color=SLEEP_LINE, zorder=7,
+                           linewidths=0)
+                ax.scatter([mid_x], [moon_y], s=38, color=BG2, zorder=8,
+                           transform=offset_t, linewidths=0)
             active_xs, active_ys = [xs[i]], [ys[i]]
         else:
             active_xs.append(xs[i])
@@ -709,7 +879,7 @@ def make_detail_pixbuf(session, dpi=150, show_points=False):
     the data range, so a hover handler can map cursor position back to the
     nearest data point without re-deriving matplotlib's tight_layout math."""
     pts = session['points']
-    xs  = [(p['ts'] - pts[0]['ts']) / 3600 for p in pts]
+    xs, breaks = _compress_xs(pts)
     ys  = [p['val'] for p in pts]
     color = RATING_COLORS.get(
         'active' if session.get('active') else session['usage_rating'], GOOD)
@@ -722,7 +892,7 @@ def make_detail_pixbuf(session, dpi=150, show_points=False):
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     _draw_discharge_line(ax, pts, xs, ys, color, show_points=show_points)
-    _smart_xticks(ax, max(xs))
+    _smart_xticks(ax, xs, pts=pts, breaks=breaks)
     plt.tight_layout(pad=0.4)
     bbox = ax.get_position()
     pb = _fig_to_pixbuf(fig, dpi, tight=False)
@@ -733,9 +903,124 @@ def make_detail_pixbuf(session, dpi=150, show_points=False):
         'xlim': xlim,
         'ylim': ylim,
         'points': [
-            ((p['ts'] - pts[0]['ts']) / 3600, p['val'],
-             datetime.datetime.fromtimestamp(p['ts']).strftime('%-I:%M %p'))
-            for p in pts
+            (x, p['val'], datetime.datetime.fromtimestamp(p['ts']).strftime('%-I:%M %p'))
+            for x, p in zip(xs, pts)
+        ],
+    }
+    return pb, meta
+
+def _bucket_session(session, granularity_h):
+    """Bucket a session's points into fixed granularity_h-hour buckets from
+    the first reading onward. A bucket is 'real' if an actual sample falls
+    within half a bucket-width of its mark, else 'idle' — held at the last
+    real value seen so far (approved over a no-data marker: see the idle-bar
+    mockup discussion). Unlike the line chart, this needs no long-gap/
+    compression handling at all — every bucket is the same width regardless
+    of how long a real gap behind it actually was."""
+    pts = session['points']
+    start_ts, end_ts = pts[0]['ts'], pts[-1]['ts']
+    bucket_s = granularity_h * 3600
+    tol_s = bucket_s / 2
+    n_buckets = int((end_ts - start_ts) // bucket_s) + 1
+
+    buckets = []
+    pi = 0
+    last_val = pts[0]['val']
+    for b in range(n_buckets + 1):
+        bucket_ts = start_ts + b * bucket_s
+        while pi + 1 < len(pts) and pts[pi + 1]['ts'] <= bucket_ts + tol_s:
+            pi += 1
+        nearest = pts[pi]
+        is_real = abs(nearest['ts'] - bucket_ts) <= tol_s
+        val = nearest['val'] if is_real else last_val
+        if is_real:
+            last_val = val
+        buckets.append({'ts': bucket_ts, 'val': val, 'real': is_real})
+    return buckets
+
+def make_detail_bar_pixbuf(session, granularity_h=1, dpi=150):
+    """Bar-chart alternative to make_detail_pixbuf — same (pixbuf, meta)
+    interface so the existing hover wiring works unchanged. Right-aligned
+    y-axis and date-boundary separators mirror the approved mockup."""
+    buckets = _bucket_session(session, granularity_h)
+    color = RATING_COLORS.get(
+        'active' if session.get('active') else session['usage_rating'], GOOD)
+    n = len(buckets)
+    bar_w = 0.82
+
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))
+    _style_ax(ax, fig)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position('right')
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=3, steps=[5, 10], integer=True))
+    xlim = (-0.6, n - 0.4)
+    ylim = (0, 100)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+
+    # Rounded-top bars (matches the approved Motorola-style mockup). A plain
+    # ax.bar() can't round corners, so each bar is a FancyBboxPatch instead.
+    # mutation_aspect must equal (axes pixel width / axes pixel height) /
+    # (x data-range / y data-range) — i.e. pixels-per-x-unit divided by
+    # pixels-per-y-unit — so the rounding looks circular in actual on-screen
+    # pixels despite x (bucket index, range ~n) and y (0-100%) living on
+    # wildly different data scales. Getting the ratio direction backwards
+    # here silently produces a mutation_aspect ~30-150x too small and the
+    # rounding vanishes rather than looking stretched, which is what made
+    # this bug so easy to mistake for "no rounding at all, in any version."
+    xrange_data = (n - 0.4) - (-0.6)
+    yrange_data = 100
+    axes_px_aspect = 2.38  # measured axes-box width/height once chrome/labels are laid out
+    mutation_aspect = axes_px_aspect * (yrange_data / xrange_data)
+    for i, b in enumerate(buckets):
+        val = b['val']
+        if val <= 0:
+            continue
+        patch = mpatches.FancyBboxPatch(
+            (i - bar_w / 2, 0), bar_w, val,
+            boxstyle='round,pad=0,rounding_size=0.16',
+            mutation_aspect=mutation_aspect, linewidth=0, zorder=3,
+            facecolor=color if b['real'] else SLEEP_LINE,
+            alpha=1.0 if b['real'] else 0.55)
+        ax.add_patch(patch)
+
+    tick_positions, tick_labels = [], []
+    prev_date = None
+    last_date_label_i = None
+    # A day boundary can fall just a few buckets after the previous one (a
+    # session starting late in the day), which would overlap the previous
+    # date label's text — the dashed boundary line is cheap to always draw,
+    # but the text itself is only worth showing with enough room to read.
+    min_label_gap = max(8, round(n * 0.10))
+    label_every = max(1, round(6 / granularity_h))
+    for i, b in enumerate(buckets):
+        dt = datetime.datetime.fromtimestamp(b['ts'])
+        if dt.date() != prev_date:
+            ax.axvline(x=i - 0.5, color=BG3, linewidth=1, linestyle='--', zorder=1)
+            if last_date_label_i is None or i - last_date_label_i >= min_label_gap:
+                ax.text(i - 0.5, 102, dt.strftime('%a %-m/%d'), fontsize=8,
+                        color=SUBTEXT, ha='left', fontweight='600')
+                last_date_label_i = i
+            prev_date = dt.date()
+        elif i % label_every == 0:
+            tick_positions.append(i)
+            tick_labels.append(dt.strftime('%-I%p').lower())
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, color=SUBTEXT, fontsize=8)
+
+    plt.tight_layout(pad=0.4)
+    bbox = ax.get_position()
+    pb = _fig_to_pixbuf(fig, dpi, tight=False)
+    plt.close(fig)
+
+    meta = {
+        'bbox': (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+        'xlim': xlim,
+        'ylim': ylim,
+        'points': [
+            (i, b['val'], datetime.datetime.fromtimestamp(b['ts']).strftime('%-I:%M %p')
+             + ('' if b['real'] else ' (idle)'))
+            for i, b in enumerate(buckets)
         ],
     }
     return pb, meta
@@ -768,7 +1053,7 @@ def make_overview_pixbuf(sessions, dpi=150):
 
 def make_estimate_pixbuf(session, avg_rate, current_pct, rolling_rate, dpi=150):
     pts  = session['points']
-    xs   = [(p['ts'] - pts[0]['ts']) / 3600 for p in pts]
+    xs, breaks = _compress_xs(pts)
     ys   = [p['val'] for p in pts]
     now_h = xs[-1]
 
@@ -797,7 +1082,7 @@ def make_estimate_pixbuf(session, avg_rate, current_pct, rolling_rate, dpi=150):
     ax.axvspan(now_h, ax.get_xlim()[1], alpha=0.04, color='white')
     ax.legend(fontsize=8, facecolor=BG2, edgecolor=BG3,
               labelcolor=SUBTEXT, loc='upper right')
-    _smart_xticks(ax, ax.get_xlim()[1])
+    _smart_xticks(ax, xs, pts=pts, breaks=breaks, max_h=ax.get_xlim()[1])
     plt.tight_layout(pad=0.4)
     pb = _fig_to_pixbuf(fig, dpi)
     plt.close(fig)
@@ -805,7 +1090,7 @@ def make_estimate_pixbuf(session, avg_rate, current_pct, rolling_rate, dpi=150):
 
 def make_sparkline_pixbuf(session, dpi=120):
     pts = session['points']
-    xs  = [(p['ts'] - pts[0]['ts']) / 3600 for p in pts]
+    xs, _breaks = _compress_xs(pts)
     ys  = [p['val'] for p in pts]
     color = RATING_COLORS.get(
         'active' if session.get('active') else session['usage_rating'], GOOD)
@@ -1008,6 +1293,7 @@ class BatteryLensWindow(Gtk.Window):
         self._sessions     = []
         self._hidden_ts    = load_hidden_ts()
         self._hidden_idxs  = set()
+        self._chart_prefs  = load_chart_prefs()
         self._selected_idx = None
         self._charging          = None
         self._charging_selected = False
@@ -1490,6 +1776,42 @@ class BatteryLensWindow(Gtk.Window):
         self._detail_chart_hover_lbl.set_xalign(1.0)
         chart_hdr_row.pack_start(self._detail_chart_hover_lbl, False, False, 0)
         self._detail_chart_card.pack_start(chart_hdr_row, False, False, 0)
+
+        # Chart style toggle — per-session (persisted in chart_prefs.json,
+        # keyed by session start_ts), not an app-wide setting: each session
+        # can use whichever of line/bar (and, for bar, bucket size) suits it.
+        style_row = _box(Gtk.Orientation.HORIZONTAL, 6)
+        self._style_line_btn = Gtk.Button(label='Line')
+        self._style_bar_btn  = Gtk.Button(label='Bar')
+        self._style_line_btn.get_style_context().add_class('style-toggle')
+        self._style_bar_btn.get_style_context().add_class('style-toggle')
+        self._style_line_btn.connect('clicked', lambda _b: self._set_chart_style('line'))
+        self._style_bar_btn.connect('clicked', lambda _b: self._set_chart_style('bar'))
+        style_row.pack_start(self._style_line_btn, False, False, 0)
+        style_row.pack_start(self._style_bar_btn, False, False, 0)
+
+        self._gran_box = _box(Gtk.Orientation.HORIZONTAL, 4)
+        self._gran_btns = {}
+        for gh in GRANULARITY_CHOICES_H:
+            gbtn = Gtk.Button(label=f'{gh}h')
+            gbtn.get_style_context().add_class('style-toggle')
+            gbtn.connect('clicked', lambda _b, gh=gh: self._set_chart_granularity(gh))
+            self._gran_btns[gh] = gbtn
+            self._gran_box.pack_start(gbtn, False, False, 0)
+        style_row.pack_start(self._gran_box, False, False, 10)
+        self._detail_chart_card.pack_start(style_row, False, False, 2)
+
+        # Long-idle badge — only shown when the session's chart condenses a
+        # 24h+ gap (see LONG_GAP_THRESHOLD_S / _compress_xs), to carry the
+        # context the compressed axis can no longer show at-a-glance.
+        self._detail_gap_badge = _label('', 'sleep-note')
+        self._detail_gap_badge.set_line_wrap(True)
+        self._detail_gap_badge.set_xalign(0)
+        self._detail_gap_badge_box = _box(spacing=0)
+        self._detail_gap_badge_box.set_margin_bottom(6)
+        self._detail_gap_badge_box.pack_start(self._detail_gap_badge, False, False, 0)
+        self._detail_gap_badge_box.set_no_show_all(True)
+        self._detail_chart_card.pack_start(self._detail_gap_badge_box, False, False, 0)
 
         self._detail_chart_image = Gtk.Image()
         # Gtk.Image has no window of its own, so events must go through an
@@ -1976,7 +2298,7 @@ class BatteryLensWindow(Gtk.Window):
 
         # No data
         if not visible:
-            self._no_data_box.show()
+            self._no_data_box.show_all()
             self._overview_chart_card.hide()
             self._ov_stat_grid.hide()
             self._estimate_panel.hide()
@@ -2132,6 +2454,42 @@ class BatteryLensWindow(Gtk.Window):
         self._detail_chart_hover_lbl.set_text('')
         return False
 
+    def _set_chart_style(self, style):
+        if self._selected_idx is None:
+            return
+        s = self._sessions[self._selected_idx]
+        key = str(int(s['start_ts']))
+        pref = dict(get_chart_pref(self._chart_prefs, s))
+        pref['style'] = style
+        self._chart_prefs[key] = pref
+        save_chart_prefs(self._chart_prefs)
+        self._show_session_detail(self._selected_idx)
+
+    def _set_chart_granularity(self, granularity_h):
+        if self._selected_idx is None:
+            return
+        s = self._sessions[self._selected_idx]
+        key = str(int(s['start_ts']))
+        pref = dict(get_chart_pref(self._chart_prefs, s))
+        pref['granularity_h'] = granularity_h
+        self._chart_prefs[key] = pref
+        save_chart_prefs(self._chart_prefs)
+        self._show_session_detail(self._selected_idx)
+
+    def _refresh_chart_style_controls(self, pref):
+        is_bar = pref['style'] == 'bar'
+        for btn, active in ((self._style_line_btn, not is_bar),
+                            (self._style_bar_btn, is_bar)):
+            ctx = btn.get_style_context()
+            (ctx.add_class if active else ctx.remove_class)('style-toggle-active')
+        self._gran_box.set_visible(is_bar)
+        for gh, gbtn in self._gran_btns.items():
+            ctx = gbtn.get_style_context()
+            active = is_bar and gh == pref.get('granularity_h', 1)
+            (ctx.add_class if active else ctx.remove_class)('style-toggle-active')
+        # "Show points" only means anything for the line chart's markers
+        self._show_points_check.set_visible(not is_bar)
+
     def _show_session_detail(self, idx):
         if idx < 0 or idx >= len(self._sessions):
             return
@@ -2170,9 +2528,22 @@ class BatteryLensWindow(Gtk.Window):
             note = (f'{sleep_count} sleep period{"s" if sleep_count > 1 else ""} detected.  '
                     f'Full-charge equivalent calculated from active time only.')
             self._sleep_note.set_text(note)
-            self._sleep_note_box.show()
+            self._sleep_note_box.show_all()
         else:
             self._sleep_note_box.hide()
+
+        # Long-idle badge — the largest 24h+ gap, if any (mirrors the
+        # condensing done on the chart itself in make_detail_pixbuf).
+        long_gaps = [g for g in s.get('sleep_gaps', [])
+                     if g[1] - g[0] > LONG_GAP_THRESHOLD_S]
+        if long_gaps:
+            ts_prev, ts_next, val_prev = max(long_gaps, key=lambda g: g[1] - g[0])
+            gap_h = (ts_next - ts_prev) / 3600
+            self._detail_gap_badge.set_text(
+                f'↳ resumed after {_fmt_gap_duration(gap_h)} idle · was {round(val_prev)}%')
+            self._detail_gap_badge_box.show_all()
+        else:
+            self._detail_gap_badge_box.hide()
 
         # Stat cards
         self._detail_equiv_card._val_lbl.set_text(fmt_duration(s['full_equiv_h']))
@@ -2189,9 +2560,13 @@ class BatteryLensWindow(Gtk.Window):
         self._batt_start_lbl.set_text(f'Started at {s["start_pct"]}%')
         self._batt_end_lbl.set_text(f'Ended at {s["end_pct"]}%')
 
+        # Chart style — per-session choice (line vs bar, + bar granularity)
+        pref = get_chart_pref(self._chart_prefs, s)
+        self._refresh_chart_style_controls(pref)
+
         # Chart label
         chart_lbl = 'Battery level over time'
-        if sleep_count > 0:
+        if pref['style'] == 'line' and sleep_count > 0:
             chart_lbl += '  ·  - - - = sleeping'
         self._detail_chart_lbl.set_text(chart_lbl)
 
@@ -2199,7 +2574,11 @@ class BatteryLensWindow(Gtk.Window):
         chart_w = _chart_width(self._detail_chart_card)
         show_points = self._show_data_points
         def render_chart():
-            pb, meta = make_detail_pixbuf(s, self._dpi, show_points=show_points)
+            if pref['style'] == 'bar':
+                pb, meta = make_detail_bar_pixbuf(
+                    s, granularity_h=pref.get('granularity_h', 1), dpi=self._dpi)
+            else:
+                pb, meta = make_detail_pixbuf(s, self._dpi, show_points=show_points)
             def update():
                 if pb:
                     h = int(pb.get_height() * chart_w / pb.get_width())
