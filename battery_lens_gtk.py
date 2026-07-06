@@ -2654,7 +2654,7 @@ class BatteryLensWindow(Gtk.Window):
 
         # Chart label
         chart_lbl = 'Battery level over time'
-        if pref['style'] == 'line' and sleep_count > 0:
+        if pref['style'] == 'line' and len(sleep_gaps) > 0:
             chart_lbl += '  ·  - - - = sleeping'
         self._detail_chart_lbl.set_text(chart_lbl)
 
